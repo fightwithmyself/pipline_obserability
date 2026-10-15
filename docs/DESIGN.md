@@ -140,8 +140,9 @@ FAILED/BLOCKED ──人工 resume/retry──► PENDING(attempt 预算重置,�
 
 固定超时对长任务无解:设短了误杀,设长了发现故障太晚。方案:
 
-- **心跳不等于存活**:心跳线程只在步骤**有进展**(`ctx.progress()` 被调用,进度/检查点前进)时才续租。
-  步骤死循环/卡住 → 不再续租 → 租约过期 → 被回收 → 僵尸被 fencing 挡住。
+- **心跳不等于存活**:worker 的续租只说明"worker 进程活着",不说明"步骤在前进"。步骤是否前进由子进程上报的
+  `ctx.progress()` / 检查点判定:worker 发现 `now - last_progress > stall_timeout` 就**主动强杀子进程并登记 `STALL`**。
+  (初稿设想为"无进展则停止续租、等租约过期",实现时改为主动判定,以便立即回收子进程;worker 整体挂掉时仍由租约过期兜底。)
 - 两个独立阈值:`stall_timeout`(无进展)与 `timeout`(总时限)。
 - **子进程隔离**:worker 为每个步骤起一个子进程(`python -m pipeline.step_runner`),职责切分如下:
 

@@ -1,2 +1,9 @@
-fastapi>=0.115,<1
-uvicorn>=0.30,<1
+# 以下版本为开发与测试时实际使用的版本。langgraph / mcp 迭代很快(mcp 2.x 已把 FastMCP 改名为 MCPServer),建议锁版本。
+# 执行引擎(pipeline/engine.py 等)只依赖 Python 标准库;下面的依赖用于接口层与 Agent 层。
+fastapi==0.143.0
+uvicorn==0.54.0
+pydantic==2.14.1
+openai==3.31.0
+langgraph==1.2.15
+langgraph-checkpoint-sqlite==3.1.2
+mcp==2.3.0

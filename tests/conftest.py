@@ -19,6 +19,13 @@ TIME_SCALE = 0.1      # 把 MOCK 步骤的耗时压缩 10 倍
 LEASE_TTL = 1.5
 
 
+@pytest.fixture(autouse=True)
+def _force_mock_llm(monkeypatch):
+    """测试永远用 MockLLM:不能因为本机设置了真实 API Key 就联网、花钱、产生不可复现的结果。"""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
 @pytest.fixture
 def data_dir(tmp_path: Path) -> Path:
     return tmp_path / "data"

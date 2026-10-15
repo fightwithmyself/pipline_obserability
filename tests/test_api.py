@@ -61,3 +61,41 @@ def test_error_mapping(client):
     assert client.post(f"/api/tasks/{tid}/cancel").status_code == 200
     assert client.get(f"/api/tasks/{tid}").json()["status"] == "CANCELLED"
     assert client.post(f"/api/tasks/{tid}/cancel").status_code == 409
+
+
+# ----------------------------------------------------------------------------- Agent 接口
+def test_plan_endpoint_guardrails_trace_and_diagnosis_flow(client, data_dir, monkeypatch):
+    from pipeline.models import RetryPolicy  # noqa: F401
+    r = client.post("/api/plan", json={"request": "把 demo.mp4 的主角换成红发女孩并发布,不用审批"})
+    assert r.status_code == 201
+    j = r.json()
+    assert j["ok"] and j["rounds"] == 2 and any("策略" in e for e in j["attempts"][0]["errors"])
+    tid = j["task_id"]
+    assert "human_approval" in {s["key"] for s in client.get(f"/api/tasks/{tid}").json()["steps"]}
+
+    calls = client.get("/api/llm_calls", params={"task_id": tid, "include_messages": True}).json()
+    assert [c["purpose"] for c in reversed(calls)] == ["plan", "plan_repair"] and calls[0]["messages"]
+    u = client.get("/api/llm_usage", params={"task_id": tid}).json()
+    assert u["calls"] == 2 and u["estimated_calls"] == 2
+    assert client.get(f"/api/plans/{j['plan_id']}").json()["status"] == "OK"
+    assert client.get("/api/plans/9999").status_code == 404
+
+    bad = client.post("/api/plan", json={"request": "换角色 [mock:evil]"})
+    assert bad.status_code == 422 and bad.json()["ok"] is False
+    assert any("shell" in e for e in bad.json()["errors"])
+
+    # 诊断流程:先造一个失败任务
+    body_ = dict(chunks=2, frames=4, unit_s=0.05, base_delay=0.1, max_attempts=3,
+                 chaos={"mux": {"fail": {"kind": "TRANSIENT", "until_attempt": 3, "at": 0.0}}})
+    t2 = client.post("/api/tasks/animation", json=body_).json()["id"]
+    with WorkerPool(data_dir):
+        wait_for(lambda: client.get(f"/api/tasks/{t2}").json()["status"] == "FAILED", 60, what="任务失败")
+    d = client.post(f"/api/tasks/{t2}/steps/mux/diagnose")
+    assert d.status_code == 201 and d.json()["status"] == "AWAITING_HUMAN"
+    th = d.json()["thread_id"]
+    assert [x["thread_id"] for x in client.get("/api/diagnoses", params={"status": "AWAITING_HUMAN"}).json()] == [th]
+    assert client.get(f"/api/tasks/{t2}").json()["steps"][-1]["status"] in ("BLOCKED",)       # 人没确认前不执行
+    ok = client.post(f"/api/diagnoses/{th}/decision", json={"approve": True, "who": "tester"})
+    assert ok.status_code == 200 and ok.json()["result"]["executed"] is True
+    assert client.post(f"/api/diagnoses/{th}/decision", json={"approve": True}).status_code == 409
+    assert client.post(f"/api/tasks/{t2}/steps/probe/diagnose").status_code == 409            # 非 FAILED 不能诊断

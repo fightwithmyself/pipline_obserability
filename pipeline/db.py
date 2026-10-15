@@ -135,6 +135,52 @@ CREATE TABLE IF NOT EXISTS approvals (
     comment  TEXT,
     ts       REAL NOT NULL
 );
+
+-- ---------------------------------------------------------------- Agent 层
+-- 每次 LLM 调用的追踪(类似 LangSmith/Langfuse 的最小自建版)
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                REAL NOT NULL,
+    task_id           TEXT,
+    plan_id           INTEGER,
+    purpose           TEXT NOT NULL,          -- plan / plan_repair / diagnose ...
+    provider          TEXT NOT NULL,          -- mock / openai-compat
+    model             TEXT NOT NULL,
+    messages          TEXT NOT NULL,          -- 请求 messages(JSON)
+    output            TEXT,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    tokens_estimated  INTEGER NOT NULL DEFAULT 0,   -- 1 = 非供应商返回的真实用量
+    latency_s         REAL,
+    cost_usd          REAL,
+    status            TEXT NOT NULL,          -- ok / error
+    error             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_task ON llm_calls(task_id);
+
+-- Planner 的每次规划:LLM 原始输出、校验错误、最终规格。恢复任务时不再询问 LLM,以此为准。
+CREATE TABLE IF NOT EXISTS plans (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       REAL NOT NULL,
+    request  TEXT NOT NULL,
+    status   TEXT NOT NULL,                   -- PLANNING / OK / REJECTED
+    attempts TEXT,                            -- [{output, errors}]
+    spec     TEXT,
+    task_id  TEXT
+);
+
+-- Diagnosis Agent 运行索引(图状态本身在 LangGraph checkpointer 里)
+CREATE TABLE IF NOT EXISTS diagnoses (
+    thread_id  TEXT PRIMARY KEY,
+    task_id    TEXT NOT NULL,
+    step_key   TEXT NOT NULL,
+    status     TEXT NOT NULL,                 -- AWAITING_HUMAN / DONE
+    proposal   TEXT,
+    decision   TEXT,
+    result     TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 

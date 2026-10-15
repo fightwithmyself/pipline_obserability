@@ -5,12 +5,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from .agent.diagnosis import DiagnosisAgent
+from .agent.llm import TracedLLM, list_llm_calls, llm_usage_summary, make_llm
+from .agent.planner import Planner, get_plan, list_plans
 from .engine import Engine, EngineError, InvalidAction, NotFound
 from .models import RetryPolicy, SpecError, TaskSpec
 from .templates import animation_swap_task
@@ -42,10 +45,22 @@ class ApprovalRequest(BaseModel):
     comment: str = ""
 
 
-def create_app(data_dir: str | Path) -> FastAPI:
+class PlanRequest(BaseModel):
+    request: str = Field(min_length=1, max_length=2000)
+
+
+class DecisionRequest(BaseModel):
+    approve: bool
+    comment: str = ""
+    who: str = "dashboard"
+
+
+def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = None) -> FastAPI:
+    """llm_factory 默认读环境变量(见 agent/llm.py),没有 Key 时是 MockLLM;测试可注入。"""
     app = FastAPI(title="Observable Task Pipeline", version="0.1")
     data_dir = Path(data_dir)
     Engine(data_dir).close()          # 确保库和表存在
+    llm_factory = llm_factory or make_llm
 
     def get_engine() -> Iterator[Engine]:
         e = Engine(data_dir)
@@ -53,6 +68,13 @@ def create_app(data_dir: str | Path) -> FastAPI:
             yield e
         finally:
             e.close()
+
+    def get_diag(eng: Engine = Depends(get_engine)) -> Iterator[DiagnosisAgent]:
+        a = DiagnosisAgent(data_dir, eng, TracedLLM(llm_factory(), eng))
+        try:
+            yield a
+        finally:
+            a.close()
 
     @app.exception_handler(NotFound)
     async def _nf(_, exc: NotFound):
@@ -148,6 +170,49 @@ def create_app(data_dir: str | Path) -> FastAPI:
     def approve(task_id: str, key: str, body: ApprovalRequest, eng: Engine = Depends(get_engine)):
         eng.approve(task_id, key, body.decision, body.who, body.comment)
         return {"ok": True}
+
+    # ------------------------------------------------------------ Agent:规划 / 追踪 / 诊断
+    @app.post("/api/plan", status_code=201)
+    def plan(req: PlanRequest, idempotency_key: str | None = Header(default=None),
+             eng: Engine = Depends(get_engine)):
+        """自然语言 → Planner(LLM + 护栏校验 + 修复回路)→ 提交。计划被护栏拒绝时返回 422 与每轮错误。"""
+        planner = Planner(TracedLLM(llm_factory(), eng), eng)
+        res = planner.plan(req.request, idempotency_key=idempotency_key)
+        if not res.ok:
+            return JSONResponse({"detail": "plan rejected by guardrails", **res.to_dict()}, status_code=422)
+        return res.to_dict()
+
+    @app.get("/api/plans")
+    def plans(eng: Engine = Depends(get_engine)):
+        return list_plans(eng)
+
+    @app.get("/api/plans/{plan_id}")
+    def plan_detail(plan_id: int, eng: Engine = Depends(get_engine)):
+        p = get_plan(eng, plan_id)
+        if p is None:
+            raise NotFound(f"plan {plan_id}")
+        return p
+
+    @app.get("/api/llm_calls")
+    def llm_calls(task_id: str | None = None, include_messages: bool = False,
+                  limit: int = Query(100, ge=1, le=500), eng: Engine = Depends(get_engine)):
+        return list_llm_calls(eng, task_id=task_id, include_messages=include_messages, limit=limit)
+
+    @app.get("/api/llm_usage")
+    def llm_usage(task_id: str | None = None, eng: Engine = Depends(get_engine)):
+        return llm_usage_summary(eng, task_id)
+
+    @app.post("/api/tasks/{task_id}/steps/{key}/diagnose", status_code=201)
+    def diagnose(task_id: str, key: str, agent: DiagnosisAgent = Depends(get_diag)):
+        return agent.start(task_id, key)
+
+    @app.get("/api/diagnoses")
+    def diagnoses(status: str | None = None, task_id: str | None = None, agent: DiagnosisAgent = Depends(get_diag)):
+        return agent.list(status, task_id)
+
+    @app.post("/api/diagnoses/{thread_id}/decision")
+    def diagnosis_decision(thread_id: str, body: DecisionRequest, agent: DiagnosisAgent = Depends(get_diag)):
+        return agent.resume(thread_id, body.approve, body.comment, body.who)
 
     # ------------------------------------------------------------ Dashboard
     @app.get("/", include_in_schema=False)

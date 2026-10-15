@@ -81,6 +81,13 @@
         <button onclick="document.getElementById('f_source').value='clip-'+Math.floor(Math.random()*9999)+'.mp4'">随机素材</button></div>
       <div id="submitmsg" class="muted" style="margin-top:4px"></div>
     </div>
+    <div class="panel" style="margin-bottom:12px">
+      <h2>自然语言提交(Planner Agent)</h2>
+      <textarea id="nl" rows="3" style="width:100%;background:#0f1419;color:var(--txt);border:1px solid var(--line);border-radius:4px;padding:4px">把 demo.mp4 的主角换成红发女孩,分成 3 段,发布到测试库</textarea>
+      <div class="muted" style="font-size:11px">试试:"……发布并且不用审批"(触发策略护栏→自动修复)</div>
+      <div style="margin-top:6px"><button onclick="submitPlan()">规划并提交</button></div>
+      <div id="planmsg" class="muted" style="margin-top:4px"></div>
+    </div>
     <div class="panel"><h2>任务列表</h2><div id="tasks"></div></div>
   </aside>
   <section>
@@ -88,6 +95,10 @@
     <div class="grid2" style="margin-top:12px">
       <div class="panel"><h2>步骤详情(点击 DAG 节点)</h2><div id="stepinfo" class="muted">未选择步骤</div></div>
       <div class="panel"><h2>事件时间线(追加式历史)</h2><div id="events"></div></div>
+    </div>
+    <div class="grid2" style="margin-top:12px">
+      <div class="panel"><h2>AI 诊断(人在回路)</h2><div id="diag" class="muted">选择任务后显示</div></div>
+      <div class="panel"><h2>LLM 调用追踪</h2><div id="llm" class="muted">选择任务后显示</div></div>
     </div>
   </section>
 </main>
@@ -119,6 +130,31 @@ async function submitTask() {
     $('submitmsg').textContent = '已提交 ' + r.id; selTask = r.id; selStep = null; evs = []; evAfter = 0;
     refresh();
   } catch (e) { $('submitmsg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
+}
+
+async function submitPlan() {
+  const request = $('nl').value.trim(); if (!request) return;
+  $('planmsg').textContent = '规划中…';
+  const r = await fetch('/api/plan', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({request})});
+  const j = await r.json();
+  if (r.ok) {
+    $('planmsg').innerHTML = `已提交 ${esc(j.task_id)} · 规划 ${j.rounds} 轮` + (j.rounds > 1
+      ? `<div class="err">第 1 轮被护栏退回:${esc((j.attempts[0].errors||[]).join(';'))}</div>` : '');
+    selTask = j.task_id; selStep = null; evs = []; evAfter = 0; refresh();
+  } else {
+    const d = j.detail || {}; const last = (j.attempts||[]).slice(-1)[0] || {};
+    $('planmsg').innerHTML = `<span class="err">计划被拒绝(${j.rounds||'?'} 轮仍不合规):${esc((j.errors||last.errors||[j.detail]).join(';'))}</span>`;
+  }
+}
+async function diagnose(key) {
+  try { await api(`/api/tasks/${selTask}/steps/${key}/diagnose`, {method:'POST'}); } catch (e) { alert(e.message); }
+  refresh();
+}
+async function decide(thread, approve) {
+  const comment = approve ? '' : (prompt('拒绝原因?') || '');
+  try { await api(`/api/diagnoses/${thread}/decision`, {method:'POST', headers:{'content-type':'application/json'},
+        body:JSON.stringify({approve, comment, who:'dashboard'})}); } catch (e) { alert(e.message); }
+  refresh();
 }
 
 async function act(path) {
@@ -206,7 +242,8 @@ async function renderStep(t) {
   const s = t.steps.find(x => x.key === selStep); if (!s) return;
   let atts = [];
   try { atts = await api(`/api/tasks/${t.id}/steps/${selStep}/attempts`); } catch (e) {}
-  const retryBtn = s.status==='FAILED' ? `<button onclick="act('/api/tasks/${t.id}/steps/${s.key}/retry')">重试此步骤</button>` : '';
+  const retryBtn = s.status==='FAILED' ? `<button onclick="act('/api/tasks/${t.id}/steps/${s.key}/retry')">重试此步骤</button>
+    <button onclick="diagnose('${s.key}')">AI 诊断</button>` : '';
   $('stepinfo').innerHTML = `
     <div><b>${esc(s.key)}</b> <span class="badge st-${s.status}">${s.status}</span> ${retryBtn}</div>
     <div class="muted">依赖: ${esc(s.deps.join(', ')||'无')} · 资源: ${s.resource} · 失败预算 ${s.failures}/${s.max_attempts} · 租约丢失 ${s.lost_count}</div>
@@ -229,6 +266,29 @@ function renderEvents() {
   }).join('');
 }
 
+async function renderAgent(t) {
+  let ds = [], calls = [], usage = {};
+  try { [ds, calls, usage] = await Promise.all([api('/api/diagnoses?task_id=' + t.id),
+        api('/api/llm_calls?task_id=' + t.id), api('/api/llm_usage?task_id=' + t.id)]); } catch (e) {}
+  $('diag').innerHTML = ds.map(d => {
+    const p = d.proposal || {};
+    const btns = d.status === 'AWAITING_HUMAN'
+      ? `<div style="margin-top:4px"><button onclick="decide('${d.thread_id}',true)">确认执行 ${esc('retry_step')}</button>
+         <button class="danger" onclick="decide('${d.thread_id}',false)">拒绝</button></div>`
+      : `<div class="muted">${d.result ? (d.result.executed ? '已执行' : '未执行:' + esc(d.result.reason)) : ''}</div>`;
+    return `<div style="border-bottom:1px solid var(--line);padding:4px 0"><b>${esc(d.step_key)}</b>
+      <span class="badge ${d.status==='DONE'?'st-SUCCEEDED':'st-AWAITING_APPROVAL'}">${d.status}</span>
+      <div>根因:${esc(p.root_cause)} <span class="muted">(${esc(p.category)}, 置信度 ${p.confidence})</span></div>
+      <div>建议:<code>${esc(p.recommended_action)}</code> — ${esc(p.explanation)}</div>${btns}</div>`;
+  }).join('') || '<span class="muted">暂无诊断。在失败步骤详情里点“AI 诊断”。</span>';
+  const est = usage.estimated_calls ? ' · 含估算 token(Mock/供应商未返回)' : '';
+  $('llm').innerHTML = `<div class="muted">${usage.calls||0} 次调用 · prompt ${usage.prompt_tokens||0} / completion ${usage.completion_tokens||0} tokens · $${usage.cost_usd||0}${est}</div>
+    <table><tr><th>时间</th><th>用途</th><th>模型</th><th>tokens</th><th>耗时</th><th>状态</th></tr>
+    ${calls.map(c => `<tr><td>${fmtT(c.ts)}</td><td>${esc(c.purpose)}</td><td>${esc(c.provider)}/${esc(c.model)}</td>
+      <td>${c.prompt_tokens??'-'}/${c.completion_tokens??'-'}${c.tokens_estimated?'~':''}</td><td>${fmtD(c.latency_s)}</td>
+      <td>${esc(c.status)}${c.error?' '+esc(c.error.slice(0,60)):''}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">无调用</td></tr>'}</table>`;
+}
+
 async function refresh() {
   try {
     const [list, m, ws] = await Promise.all([api('/api/tasks'), api('/api/metrics'), api('/api/workers')]);
@@ -237,7 +297,7 @@ async function refresh() {
     renderTasks(list);
     if (selTask) {
       const t = await api('/api/tasks/' + selTask); curTask = t;
-      renderDetail(t); await renderStep(t);
+      renderDetail(t); await renderStep(t); await renderAgent(t);
       const more = await api(`/api/tasks/${selTask}/events?after=${evAfter}`);
       if (more.length) { evs = evs.concat(more); evAfter = more[more.length-1].seq; }
       renderEvents();

@@ -517,6 +517,13 @@ class Engine:
                 self._recompute_blocked(task_id)
             self._refresh_task(task_id)
 
+    def add_event(self, task_id: str, kind: str, step_key: str | None = None, detail: dict | None = None) -> None:
+        """追加一条非状态变更类事件(如 Agent 的诊断/动作记录),进入同一条可查询的历史。"""
+        with tx(self.conn):
+            if self.conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+                raise NotFound(task_id)
+            self._emit(task_id, step_key, kind, detail=detail)
+
     # ------------------------------------------------------------------ 查询
     def _step_view(self, r, dep_keys: list[str]) -> dict:
         return {

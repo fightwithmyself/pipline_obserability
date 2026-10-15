@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>任务管线可观测面板</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1419; --panel:#171d25; --line:#2a3340; --txt:#d7dde5; --dim:#8794a6;
+    --pending:#5b6675; --running:#3b82f6; --retry:#f59e0b; --wait:#a855f7; --ok:#22c55e; --fail:#ef4444;
+    --blocked:#475569; --cancel:#6b7280; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px/1.45 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--txt); }
+  header { display:flex; align-items:center; gap:16px; padding:10px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; }
+  .chip { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:2px 10px; color:var(--dim); font-size:12px; }
+  .chip b { color:var(--txt); }
+  .chip.dead { border-color:var(--fail); color:var(--fail); }
+  main { display:grid; grid-template-columns:300px 1fr; gap:12px; padding:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .panel h2 { font-size:13px; margin:0 0 8px; color:var(--dim); font-weight:600; }
+  .task { padding:8px; border:1px solid var(--line); border-radius:6px; margin-bottom:6px; cursor:pointer; }
+  .task:hover, .task.sel { border-color:var(--running); }
+  .task .row { display:flex; justify-content:space-between; gap:6px; }
+  .badge { font-size:11px; padding:1px 7px; border-radius:10px; color:#fff; white-space:nowrap; }
+  .st-PENDING{background:var(--pending)} .st-RUNNING{background:var(--running)} .st-RETRY_WAIT{background:var(--retry)}
+  .st-AWAITING_APPROVAL{background:var(--wait)} .st-SUCCEEDED{background:var(--ok)} .st-FAILED{background:var(--fail)}
+  .st-BLOCKED{background:var(--blocked)} .st-CANCELLED{background:var(--cancel)}
+  .bar { height:5px; background:#222b36; border-radius:3px; overflow:hidden; margin-top:6px; }
+  .bar > i { display:block; height:100%; background:var(--running); transition:width .4s; }
+  .bar.ok > i { background:var(--ok); } .bar.bad > i { background:var(--fail); }
+  button { background:#222b36; color:var(--txt); border:1px solid var(--line); border-radius:5px; padding:4px 10px; cursor:pointer; font-size:12px; }
+  button:hover { border-color:var(--running); } button.danger:hover { border-color:var(--fail); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  label { display:block; margin:4px 0; color:var(--dim); font-size:12px; }
+  input[type=text], input[type=number], select { background:#0f1419; color:var(--txt); border:1px solid var(--line); border-radius:4px; padding:3px 6px; width:100%; }
+  #dagwrap { position:relative; overflow:auto; padding:6px 0 12px; }
+  #dag { position:relative; }
+  svg#edges { position:absolute; left:0; top:0; pointer-events:none; }
+  .node { position:absolute; width:158px; height:58px; border-radius:7px; padding:5px 8px; border:2px solid var(--line); background:#1b222c; cursor:pointer; overflow:hidden; }
+  .node .k { font-weight:600; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .node .m { color:var(--dim); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .node.sel { box-shadow:0 0 0 2px #fff3; }
+  .n-PENDING{border-color:var(--pending)} .n-RUNNING{border-color:var(--running);animation:pulse 1.2s infinite}
+  .n-RETRY_WAIT{border-color:var(--retry)} .n-AWAITING_APPROVAL{border-color:var(--wait)} .n-SUCCEEDED{border-color:var(--ok)}
+  .n-FAILED{border-color:var(--fail)} .n-BLOCKED{border-color:var(--blocked);opacity:.6} .n-CANCELLED{border-color:var(--cancel);opacity:.6}
+  @keyframes pulse { 50% { box-shadow:0 0 8px var(--running); } }
+  .tag { font-size:10px; padding:0 5px; border-radius:3px; background:#2a3340; color:var(--txt); margin-left:3px; }
+  .tag.cache { background:#0e7490; } .tag.gpu { background:#7c3aed; } .tag.retry { background:var(--retry); color:#111; }
+  table { border-collapse:collapse; width:100%; font-size:12px; } td,th { border-bottom:1px solid var(--line); padding:3px 6px; text-align:left; vertical-align:top; }
+  th { color:var(--dim); font-weight:600; }
+  #events { max-height:260px; overflow:auto; font:12px/1.5 ui-monospace,Consolas,monospace; }
+  #events div { border-bottom:1px dashed #222b36; padding:1px 0; white-space:pre-wrap; word-break:break-all; }
+  .k-COMMIT_REJECTED,.k-FAIL_REJECTED,.k-CACHE_INVALID { color:var(--retry); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .muted { color:var(--dim); } .err { color:var(--fail); }
+  code { background:#0f1419; padding:0 4px; border-radius:3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>任务管线可观测面板</h1>
+  <span id="chips"></span><span id="workers"></span>
+</header>
+<main>
+  <aside>
+    <div class="panel" style="margin-bottom:12px">
+      <h2>提交演示任务(角色替换)</h2>
+      <label>素材 source(相同 source 会命中缓存)<input type="text" id="f_source" value="demo.mp4"></label>
+      <label>分块数 chunks<input type="number" id="f_chunks" value="4" min="1" max="16"></label>
+      <label>故障注入
+        <select id="f_chaos">
+          <option value="">无</option>
+          <option value="transient">segment_0 瞬时失败 2 次(重试)</option>
+          <option value="crash">segment_1 进程崩溃(exit 137)</option>
+          <option value="hang">swap_0 卡死(无进展,5s 后强杀)</option>
+          <option value="qc">质检永久失败(下游 BLOCKED)</option>
+          <option value="source">坏素材(probe 永久失败)</option>
+        </select></label>
+      <label><input type="checkbox" id="f_approval"> 发布前需要人工审批</label>
+      <div style="display:flex;gap:6px;margin-top:6px"><button onclick="submitTask()">提交</button>
+        <button onclick="document.getElementById('f_source').value='clip-'+Math.floor(Math.random()*9999)+'.mp4'">随机素材</button></div>
+      <div id="submitmsg" class="muted" style="margin-top:4px"></div>
+    </div>
+    <div class="panel"><h2>任务列表</h2><div id="tasks"></div></div>
+  </aside>
+  <section>
+    <div class="panel" id="detail"><span class="muted">← 选择一个任务</span></div>
+    <div class="grid2" style="margin-top:12px">
+      <div class="panel"><h2>步骤详情(点击 DAG 节点)</h2><div id="stepinfo" class="muted">未选择步骤</div></div>
+      <div class="panel"><h2>事件时间线(追加式历史)</h2><div id="events"></div></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtT = ts => ts ? new Date(ts*1000).toLocaleTimeString('zh-CN',{hour12:false}) : '-';
+const fmtD = s => s==null ? '-' : (s<1 ? (s*1000|0)+'ms' : s.toFixed(1)+'s');
+let selTask = null, selStep = null, evs = [], evAfter = 0, curTask = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || r.statusText);
+  return j;
+}
+
+async function submitTask() {
+  const chaosKey = $('f_chaos').value;
+  const body = { source: $('f_source').value, chunks: +$('f_chunks').value, frames: Math.max(+$('f_chunks').value*4, 8),
+                 require_approval: $('f_approval').checked, unit_s: 0.5, base_delay: 1 };
+  if (chaosKey === 'transient') body.chaos = {segment_0:{fail:{kind:'TRANSIENT',until_attempt:2,at:0.3}}};
+  if (chaosKey === 'crash') body.chaos = {segment_1:{crash:{at:0.5,on_attempts:[1]}}};
+  if (chaosKey === 'hang') { body.chaos = {swap_0:{hang:{at:0.5,on_attempts:[1]}}}; body.stall_timeout_s = 5; }
+  if (chaosKey === 'qc') body.qc_fail = true;
+  if (chaosKey === 'source') body.source = 'bad:corrupt.mp4';
+  try {
+    const r = await api('/api/tasks/animation', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+    $('submitmsg').textContent = '已提交 ' + r.id; selTask = r.id; selStep = null; evs = []; evAfter = 0;
+    refresh();
+  } catch (e) { $('submitmsg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
+}
+
+async function act(path) {
+  try { await api(path, {method:'POST', headers:{'content-type':'application/json'}, body:'{}'}); }
+  catch (e) { alert(e.message); }
+  refresh();
+}
+async function approve(key, decision) {
+  const comment = decision==='reject' ? (prompt('拒绝原因?') || '') : '';
+  try { await api(`/api/tasks/${selTask}/steps/${key}/approve`, {method:'POST', headers:{'content-type':'application/json'},
+        body:JSON.stringify({decision, who:'dashboard', comment})}); } catch (e) { alert(e.message); }
+  refresh();
+}
+
+function renderHeader(m, ws) {
+  const t = m.tasks_by_status || {};
+  $('chips').innerHTML = [
+    ['任务', Object.entries(t).map(([k,v])=>k[0]+k.slice(1).toLowerCase()+' '+v).join(' / ') || '0'],
+    ['队列深度', m.queue_depth], ['缓存命中步骤', m.cache_hit_steps],
+    ['有效耗时', (m.effective_seconds||0)+'s'], ['浪费耗时', (m.wasted_seconds||0)+'s'],
+    ['浪费率', m.waste_ratio==null?'-':(m.waste_ratio*100).toFixed(1)+'%'],
+  ].map(([a,b])=>`<span class="chip">${a} <b>${esc(b)}</b></span>`).join(' ');
+  $('workers').innerHTML = ws.map(w => `<span class="chip ${w.alive?'':'dead'}">${esc(w.id)} ${esc(w.resources.join('/'))} ${w.alive?'在线':'失联'}${w.current_step?' · 执行中':''}</span>`).join(' ');
+}
+
+function renderTasks(list) {
+  $('tasks').innerHTML = list.map(t => {
+    const bad = t.status==='FAILED', ok = t.status==='SUCCEEDED';
+    return `<div class="task ${t.id===selTask?'sel':''}" onclick="pick('${t.id}')">
+      <div class="row"><b>${esc(t.name)}</b><span class="badge st-${t.status}">${t.status}</span></div>
+      <div class="muted">${esc(t.id)} · ${t.steps_succeeded}/${t.steps_total} 步 · 缓存 ${t.cached_steps}</div>
+      <div class="bar ${ok?'ok':bad?'bad':''}"><i style="width:${t.percent}%"></i></div></div>`;
+  }).join('') || '<span class="muted">暂无任务</span>';
+}
+function pick(id) { selTask = id; selStep = null; evs = []; evAfter = 0; refresh(); }
+
+function layout(steps) {
+  const by = Object.fromEntries(steps.map(s => [s.key, s])), depth = {};
+  const d = k => depth[k] ??= (by[k].deps.length ? 1 + Math.max(...by[k].deps.map(d)) : 0);
+  steps.forEach(s => d(s.key));
+  const cols = {};
+  steps.forEach(s => (cols[depth[s.key]] ??= []).push(s));
+  const pos = {};
+  Object.entries(cols).forEach(([c, arr]) => arr.forEach((s, i) => pos[s.key] = {x: c*200+10, y: i*72+10}));
+  const W = (Math.max(...Object.keys(cols).map(Number))+1)*200+20, H = Math.max(...Object.values(cols).map(a=>a.length))*72+20;
+  return {pos, W, H};
+}
+
+function renderDag(t) {
+  const {pos, W, H} = layout(t.steps);
+  let svg = `<svg id="edges" width="${W}" height="${H}"><defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4b5767"/></marker></defs>`;
+  t.steps.forEach(s => s.deps.forEach(dk => {
+    const a = pos[dk], b = pos[s.key], x1 = a.x+158, y1 = a.y+29, x2 = b.x, y2 = b.y+29, mx = (x1+x2)/2;
+    svg += `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2-2},${y2}" stroke="#3a4656" fill="none" marker-end="url(#ar)"/>`;
+  }));
+  svg += '</svg>';
+  const nodes = t.steps.map(s => {
+    const p = pos[s.key], extra = s.status==='RUNNING' ? ` ${(s.progress*100|0)}%` : '';
+    return `<div class="node n-${s.status} ${s.key===selStep?'sel':''}" style="left:${p.x}px;top:${p.y}px" onclick="pickStep('${s.key}')">
+      <div class="k">${esc(s.key)}${s.resource==='gpu'?'<span class="tag gpu">GPU</span>':''}${s.cached?'<span class="tag cache">缓存</span>':''}${s.attempt_no>1?`<span class="tag retry">#${s.attempt_no}</span>`:''}</div>
+      <div class="m">${s.status}${extra}${s.error_kind?' · '+esc(s.error_kind):''}</div>
+      <div class="bar ${s.status==='SUCCEEDED'?'ok':''}"><i style="width:${s.status==='SUCCEEDED'?100:(s.progress*100)}%"></i></div></div>`;
+  }).join('');
+  return `<div id="dagwrap"><div id="dag" style="width:${W}px;height:${H}px">${svg}${nodes}</div></div>`;
+}
+
+function renderDetail(t) {
+  const wait = t.waiting_approval.map(k => `<button onclick="approve('${k}','approve')">批准 ${esc(k)}</button>
+        <button class="danger" onclick="approve('${k}','reject')">拒绝</button>`).join(' ');
+  $('detail').innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <div><b>${esc(t.name)}</b> <span class="muted">${esc(t.id)}</span> <span class="badge st-${t.status}">${t.status}</span>
+        ${t.has_failed_steps && t.status==='RUNNING' ? '<span class="badge st-RETRY_WAIT">存在失败步骤</span>':''}
+        <span class="muted"> ${t.percent}% · 运行中: ${esc(t.running_steps.join(', ')||'-')}</span></div>
+      <div>${wait}
+        <button onclick="act('/api/tasks/${t.id}/resume')" ${t.status==='FAILED'?'':'disabled'}>恢复(重试失败步骤)</button>
+        <button class="danger" onclick="act('/api/tasks/${t.id}/cancel')" ${['SUCCEEDED','CANCELLED'].includes(t.status)?'disabled':''}>取消</button></div>
+    </div>
+    <div class="bar ${t.status==='SUCCEEDED'?'ok':t.status==='FAILED'?'bad':''}" style="height:7px;margin:8px 0"><i style="width:${t.percent}%"></i></div>
+    ${renderDag(t)}`;
+}
+
+async function renderStep(t) {
+  if (!selStep) { $('stepinfo').innerHTML = '<span class="muted">未选择步骤</span>'; return; }
+  const s = t.steps.find(x => x.key === selStep); if (!s) return;
+  let atts = [];
+  try { atts = await api(`/api/tasks/${t.id}/steps/${selStep}/attempts`); } catch (e) {}
+  const retryBtn = s.status==='FAILED' ? `<button onclick="act('/api/tasks/${t.id}/steps/${s.key}/retry')">重试此步骤</button>` : '';
+  $('stepinfo').innerHTML = `
+    <div><b>${esc(s.key)}</b> <span class="badge st-${s.status}">${s.status}</span> ${retryBtn}</div>
+    <div class="muted">依赖: ${esc(s.deps.join(', ')||'无')} · 资源: ${s.resource} · 失败预算 ${s.failures}/${s.max_attempts} · 租约丢失 ${s.lost_count}</div>
+    ${s.status==='RUNNING'?`<div>租约持有者 <code>${esc(s.lease_owner)}</code> 到期 ${fmtT(s.lease_expires_at)} · 进度 ${esc(s.progress_msg||'')}</div>`:''}
+    ${s.status==='RETRY_WAIT'?`<div>下次重试 ${fmtT(s.next_run_at)}</div>`:''}
+    ${s.checkpoint?`<div>检查点: <code>已完成 ${esc(s.checkpoint.done)} 帧</code></div>`:''}
+    ${s.error_msg?`<div class="err">${esc(s.error_kind)}: ${esc(s.error_msg).slice(0,300)}</div>`:''}
+    <div class="muted">cache_key ${esc((s.cache_key||'').slice(0,12))}${s.cached?' (命中缓存,未执行)':''}</div>
+    <table style="margin-top:6px"><tr><th>#</th><th>worker</th><th>开始</th><th>耗时</th><th>结果</th><th>备注</th></tr>
+    ${atts.map(a => `<tr><td>${a.attempt_no}</td><td>${esc(a.worker_id)}</td><td>${fmtT(a.started_at)}</td><td>${fmtD(a.duration)}</td>
+      <td>${esc(a.outcome)}${a.error_kind?' / '+esc(a.error_kind):''}<div class="err">${esc((a.error_msg||'').slice(0,120))}</div></td>
+      <td>${a.notes?esc(JSON.stringify(a.notes)):''}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">无执行记录</td></tr>'}</table>`;
+}
+function pickStep(k) { selStep = k; if (curTask) { $('detail').querySelectorAll('.node').forEach(n => n.classList.toggle('sel', n.querySelector('.k').textContent.startsWith(k))); renderStep(curTask); } }
+
+function renderEvents() {
+  $('events').innerHTML = evs.slice(-120).reverse().map(e => {
+    const d = e.detail ? ' ' + JSON.stringify(e.detail) : '';
+    return `<div class="k-${e.kind}">#${e.seq} ${fmtT(e.ts)} ${esc(e.kind)} ${esc(e.step_key||'')} ${esc(e.from||'')}${e.to?'→'+esc(e.to):''}${e.attempt_no?' a'+e.attempt_no:''}${esc(d.slice(0,200))}</div>`;
+  }).join('');
+}
+
+async function refresh() {
+  try {
+    const [list, m, ws] = await Promise.all([api('/api/tasks'), api('/api/metrics'), api('/api/workers')]);
+    renderHeader(m, ws);
+    if (!selTask && list.length) selTask = list[0].id;
+    renderTasks(list);
+    if (selTask) {
+      const t = await api('/api/tasks/' + selTask); curTask = t;
+      renderDetail(t); await renderStep(t);
+      const more = await api(`/api/tasks/${selTask}/events?after=${evAfter}`);
+      if (more.length) { evs = evs.concat(more); evAfter = more[more.length-1].seq; }
+      renderEvents();
+    }
+  } catch (e) { console.warn(e); }
+}
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>

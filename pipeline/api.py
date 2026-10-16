@@ -201,6 +201,49 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
     def step_attempts(task_id: str, key: str, eng: Engine = Depends(get_engine)):
         return eng.get_attempts(task_id, key)
 
+    # ---- 步骤详情:输入 / 输出 / 参数。输入 = 依赖步骤的产物;输出 = 本步骤的产物;小文本直接内嵌预览
+    PREVIEW_MAX = 20000
+    KINDS = {".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image", ".gif": "image",
+             ".mp4": "video", ".webm": "video", ".mov": "video",
+             ".json": "text", ".txt": "text", ".md": "text", ".log": "text"}
+
+    def _describe(eng: Engine, outputs: dict | None) -> list[dict]:
+        items = []
+        for name, o in sorted((outputs or {}).items()):
+            kind = KINDS.get(Path(name).suffix.lower(), "file")
+            it = {"name": name, "sha256": o.get("sha256"), "size": o.get("size"), "kind": kind}
+            if kind == "text" and (o.get("size") or 0) <= PREVIEW_MAX:
+                p = eng.store.path(o["sha256"])
+                if p.is_file():
+                    it["preview"] = p.read_text(encoding="utf-8", errors="replace")
+            items.append(it)
+        return items
+
+    @app.get("/api/tasks/{task_id}/steps/{key}/io")
+    def step_io(task_id: str, key: str, eng: Engine = Depends(get_engine)):
+        t = eng.get_task(task_id)
+        s = next((x for x in t["steps"] if x["key"] == key), None)
+        if s is None:
+            raise HTTPException(404, f"步骤不存在: {key}")
+        by_key = {x["key"]: x for x in t["steps"]}
+        return {"params": s["params"], "outputs": _describe(eng, s["outputs"]),
+                "inputs": [{"from": d, "status": by_key[d]["status"], "artifacts": _describe(eng, by_key[d]["outputs"])}
+                           for d in s["deps"] if d in by_key]}
+
+    @app.get("/api/artifacts/{sha}")
+    def artifact(sha: str, name: str = "", eng: Engine = Depends(get_engine)):
+        """按内容哈希取产物(图片/视频/文本预览用)。只能取引擎登记过的产物,不接受任何路径。"""
+        import mimetypes
+        import re
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise HTTPException(422, "sha 必须是 64 位十六进制")
+        if eng.conn.execute("SELECT 1 FROM artifacts WHERE sha256=?", (sha,)).fetchone() is None:
+            raise HTTPException(404, "产物不存在")
+        p = eng.store.path(sha)
+        if not p.is_file():
+            raise HTTPException(404, "产物文件缺失")
+        return FileResponse(p, media_type=mimetypes.guess_type(Path(name).name)[0] or "application/octet-stream")
+
     @app.get("/api/workers")
     def workers(eng: Engine = Depends(get_engine)):
         return eng.list_workers()

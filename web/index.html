@@ -287,27 +287,72 @@ function renderDetail(t) {
     ${renderDag(t)}`;
 }
 
+const artUrl = a => `/api/artifacts/${a.sha256}?name=${encodeURIComponent(a.name)}`;
+const fmtSize = n => n == null ? '' : n < 1024 ? n + ' B' : n < 1048576 ? (n/1024).toFixed(1) + ' KB' : (n/1048576).toFixed(2) + ' MB';
+function artHtml(a) {
+  const head = `<code>${esc(a.name)}</code> <span class="muted">${fmtSize(a.size)} · ${esc((a.sha256||'').slice(0,10))}</span>`;
+  if (a.kind === 'image') return `<div>${head}<br><a href="${artUrl(a)}" target="_blank"><img src="${artUrl(a)}" style="max-width:100%;max-height:200px;border:1px solid var(--line);margin-top:3px"></a></div>`;
+  if (a.kind === 'video') return `<div>${head}<br><video controls preload="metadata" src="${artUrl(a)}" style="max-width:100%;max-height:220px;margin-top:3px"></video></div>`;
+  if (a.kind === 'text' && a.preview != null)
+    return `<details><summary>${head}</summary><pre style="white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto;background:#0f1419;padding:6px;margin:3px 0">${esc(a.preview)}</pre></details>`;
+  return `<div>${head} <a href="${artUrl(a)}" target="_blank">下载</a></div>`;
+}
+function usageHtml(att) {
+  const n = (att && att.notes) || {};
+  const u = n.usage; if (!u && n.cost_cny_est == null) return '<span class="muted">本步骤没有记录用量</span>';
+  const rows = Object.entries(u || {}).filter(([k, v]) => v !== null && v !== undefined)
+    .map(([k, v]) => `<tr><td class="muted">${esc(k)}</td><td>${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`).join('');
+  const cost = n.cost_cny_est != null ? `<tr><td class="muted">cost_cny_est</td><td><b>${esc(n.cost_cny_est)} 元</b> <span class="muted">${esc(n.cost_note || '')}</span></td></tr>` : '';
+  return `<table style="width:auto">${rows}${cost}</table>`;
+}
+let _stepSig = '';
 async function renderStep(t) {
-  if (!selStep) { $('stepinfo').innerHTML = '<span class="muted">未选择步骤</span>'; return; }
+  if (!selStep) { $('stepinfo').innerHTML = '<span class="muted">未选择步骤</span>'; _stepSig = ''; return; }
   const s = t.steps.find(x => x.key === selStep); if (!s) return;
-  let atts = [];
+  // 没有变化就不重绘:否则每秒刷新会把正在播放的视频重置
+  const sig = [t.id, s.key, s.status, s.attempt_no, s.failures, s.finished_at, s.status === 'RUNNING' ? s.progress_msg : ''].join('|');
+  if (sig === _stepSig) return;
+  let atts = [], io = {params: {}, inputs: [], outputs: []};
   try { atts = await api(`/api/tasks/${t.id}/steps/${selStep}/attempts`); } catch (e) {}
+  try { io = await api(`/api/tasks/${t.id}/steps/${selStep}/io`); } catch (e) {}
+  _stepSig = sig;
+  const last = atts[atts.length - 1];
   const retryBtn = s.status==='FAILED' ? `<button onclick="act('/api/tasks/${t.id}/steps/${s.key}/retry')">重试此步骤</button>
     <button onclick="diagnose('${s.key}')">AI 诊断</button>` : '';
+  const ck = s.checkpoint ? (s.checkpoint.external_task_id
+    ? `<div>检查点: 外部任务 <code>${esc(s.checkpoint.external_task_id)}</code>(重试时沿用,不会重复提交)</div>`
+    : `<div>检查点: <code>已完成 ${esc(s.checkpoint.done)} 帧</code></div>`) : '';
+  const inputs = io.inputs.length ? io.inputs.map(g => `<div style="margin:4px 0"><span class="muted">来自 <b>${esc(g.from)}</b> (${esc(g.status)})</span>
+      ${g.artifacts.map(artHtml).join('') || '<div class="muted">无产物</div>'}</div>`).join('') : '<span class="muted">无上游步骤</span>';
+  const outputs = io.outputs.length ? io.outputs.map(artHtml).join('') : '<span class="muted">暂无产物</span>';
+  const notes = (a) => {
+    const n = a.notes || {}, polls = Object.keys(n).filter(k => /^poll_\d+$/.test(k)).sort();
+    const rest = Object.fromEntries(Object.entries(n).filter(([k]) => !/^poll_\d+$/.test(k) && k !== 'usage'));
+    const pollTbl = polls.length ? `<details><summary>外部任务轮询 ${polls.length} 轮</summary><table style="width:auto"><tr><th>轮</th><th>状态</th><th>已等待</th><th>token</th><th>usage</th></tr>
+      ${polls.map(k => `<tr><td>${k.slice(5)}</td><td>${esc(n[k].status)}</td><td>${esc(n[k].elapsed_s)}s</td><td>${esc(n[k].tokens)}</td><td>${esc(n[k].usage ? JSON.stringify(n[k].usage) : '')}</td></tr>`).join('')}</table></details>` : '';
+    const restTxt = Object.keys(rest).length ? `<details><summary>备注(notes)</summary><pre style="white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto;margin:3px 0">${esc(JSON.stringify(rest, null, 2))}</pre></details>` : '';
+    return pollTbl + restTxt;
+  };
   $('stepinfo').innerHTML = `
-    <div><b>${esc(s.key)}</b> <span class="badge st-${s.status}">${s.status}</span> ${retryBtn}</div>
+    <div><b>${esc(s.key)}</b> <span class="badge st-${s.status}">${s.status}</span> <span class="muted">${esc(s.type)}</span> ${retryBtn}</div>
     <div class="muted">依赖: ${esc(s.deps.join(', ')||'无')} · 资源: ${s.resource} · 失败预算 ${s.failures}/${s.max_attempts} · 租约丢失 ${s.lost_count}</div>
     ${s.status==='RUNNING'?`<div>租约持有者 <code>${esc(s.lease_owner)}</code> 到期 ${fmtT(s.lease_expires_at)} · 进度 ${esc(s.progress_msg||'')}</div>`:''}
     ${s.status==='RETRY_WAIT'?`<div>下次重试 ${fmtT(s.next_run_at)}</div>`:''}
-    ${s.checkpoint?`<div>检查点: <code>已完成 ${esc(s.checkpoint.done)} 帧</code></div>`:''}
-    ${s.error_msg?`<div class="err">${esc(s.error_kind)}: ${esc(s.error_msg).slice(0,300)}</div>`:''}
+    ${ck}
+    ${s.error_msg?`<div class="err">${esc(s.error_kind)}: ${esc(s.error_msg).slice(0,400)}</div>`:''}
     <div class="muted">cache_key ${esc((s.cache_key||'').slice(0,12))}${s.cached?' (命中缓存,未执行)':''}</div>
-    <table style="margin-top:6px"><tr><th>#</th><th>worker</th><th>开始</th><th>耗时</th><th>结果</th><th>备注</th></tr>
+    <h3 style="margin:8px 0 2px;font-size:13px">用量 / 费用 <span class="muted">(最近一次尝试)</span></h3>${usageHtml(last)}
+    <h3 style="margin:8px 0 2px;font-size:13px">输入</h3>${inputs}
+    <h3 style="margin:8px 0 2px;font-size:13px">输出</h3>${outputs}
+    <details style="margin-top:6px"><summary>参数(params)</summary><pre style="white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto">${esc(JSON.stringify(io.params, null, 2))}</pre></details>
+    <h3 style="margin:8px 0 2px;font-size:13px">执行记录</h3>
+    <table style="margin-top:2px"><tr><th>#</th><th>worker</th><th>开始</th><th>耗时</th><th>结果</th><th>备注</th></tr>
     ${atts.map(a => `<tr><td>${a.attempt_no}</td><td>${esc(a.worker_id)}</td><td>${fmtT(a.started_at)}</td><td>${fmtD(a.duration)}</td>
-      <td>${esc(a.outcome)}${a.error_kind?' / '+esc(a.error_kind):''}<div class="err">${esc((a.error_msg||'').slice(0,120))}</div></td>
-      <td>${a.notes?esc(JSON.stringify(a.notes)):''}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">无执行记录</td></tr>'}</table>`;
+      <td>${esc(a.outcome)}${a.error_kind?' / '+esc(a.error_kind):''}<div class="err">${esc((a.error_msg||'').slice(0,160))}</div></td>
+      <td>${notes(a)}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">无执行记录</td></tr>'}</table>`;
 }
-function pickStep(k) { selStep = k; if (curTask) { $('detail').querySelectorAll('.node').forEach(n => n.classList.toggle('sel', n.querySelector('.k').textContent.startsWith(k))); renderStep(curTask); } }
+
+function pickStep(k) { selStep = k; _stepSig = ''; if (curTask) { $('detail').querySelectorAll('.node').forEach(n => n.classList.toggle('sel', n.querySelector('.k').textContent.startsWith(k))); renderStep(curTask); } }
 
 function renderEvents() {
   $('events').innerHTML = evs.slice(-120).reverse().map(e => {

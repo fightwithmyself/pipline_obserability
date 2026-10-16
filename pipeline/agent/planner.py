@@ -112,8 +112,12 @@ def parse_json_loose(text: str) -> Any:
     raise ValueError("找不到 JSON 对象")
 
 
-def validate_plan(raw: Any) -> tuple[PlanModel | None, list[str]]:
-    """返回 (计划, 错误列表)。错误一次性收集完,方便整体反馈给 LLM。"""
+def validate_plan(raw: Any, request: str | None = None) -> tuple[PlanModel | None, list[str]]:
+    """返回 (计划, 错误列表)。错误一次性收集完,方便整体反馈给 LLM。
+
+    传入 request 时,还要求 source 必须逐字出现在用户请求里:否则模型在"修复"循环中可以把
+    被拒绝的文件名悄悄换成别的文件(真实模型评测中出现过:../../etc/passwd.mp4 被拒后改成了 input.mp4)。
+    """
     try:
         plan = PlanModel.model_validate(raw)
     except ValidationError as e:
@@ -164,6 +168,8 @@ def validate_plan(raw: Any) -> tuple[PlanModel | None, list[str]]:
     p = plan.params
     if not SOURCE_RE.match(p.source) or ".." in p.source or p.source.startswith("/"):
         errs.append(f"source 不合法(只允许相对路径的 mp4/mov/webm/mkv 文件名): {p.source!r}")
+    elif request is not None and p.source.lower() not in request.lower():
+        errs.append(f"source {p.source!r} 没有出现在用户请求里;只能使用用户明确给出的文件名,不能自行替换或编造")
     if not 1 <= p.chunks <= MAX_CHUNKS:
         errs.append(f"chunks 必须在 1~{MAX_CHUNKS},当前 {p.chunks}")
     if not 1 <= p.frames <= MAX_FRAMES:
@@ -275,7 +281,7 @@ class Planner:
             except ValueError as e:
                 plan, errors = None, [f"输出不是合法 JSON: {e}"]
             else:
-                plan, errors = validate_plan(raw)
+                plan, errors = validate_plan(raw, request)
             attempts.append({"output": res.text, "errors": errors})
             if not errors:
                 break

@@ -107,6 +107,37 @@ def test_validate_plan_rejects_bad_sources_and_extra_fields():
     assert errs == [] and plan is not None
 
 
+def test_source_must_come_from_the_user_request():
+    """真实模型评测发现的漏洞:被拒的文件名可以在"修复"循环里被悄悄换成别的文件。"""
+    ok_plan = _plan(params={"source": "demo.mp4"})
+    assert validate_plan(ok_plan, "把 DEMO.mp4 的主角换成红发女孩")[1] == []          # 大小写不敏感
+    plan, errs = validate_plan(ok_plan, "把 other.mp4 的主角换成红发女孩")
+    assert plan is None and any("没有出现在用户请求里" in e for e in errs)
+    assert validate_plan(ok_plan)[1] == []                                          # 不传 request 时不检查
+
+
+def test_repair_loop_cannot_swap_the_file_the_user_asked_for(engine):
+    """第 1 轮给了穿越路径被拒,第 2 轮"修复"成用户从没提过的文件 —— 必须仍被拒绝、不提交。"""
+    from pipeline.agent.llm import LLMResult
+
+    def reply(source):
+        body = {"summary": "x", "params": {"source": source},
+                "stages": [{"id": "probe", "type": "probe", "deps": []}]}
+        return LLMResult(json.dumps(body), 10, 10, False, "scripted")
+
+    class Scripted:
+        provider, model = "scripted", "scripted"
+        def __init__(self):
+            self.outs = iter(["../../etc/passwd.mp4", "input.mp4", "input.mp4"])
+        def complete(self, messages, *, json_mode=False, temperature=0.0):
+            return reply(next(self.outs))
+
+    pl = Planner(TracedLLM(Scripted(), engine), engine, retry=R, unit_s=0.05)
+    r = pl.plan("把 ../../etc/passwd.mp4 的主角换成红发女孩,发布到测试库")
+    assert not r.ok and r.task_id is None and engine.list_tasks() == []
+    assert any("没有出现在用户请求里" in e for e in r.errors)
+
+
 def test_parse_json_loose_tolerates_fences_and_chatter():
     assert parse_json_loose('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json_loose('好的,结果如下:{"a": {"b": 2}} 以上') == {"a": {"b": 2}}

@@ -56,9 +56,12 @@ def run_case(planner: Planner, case: dict) -> dict:
     out = {"id": case["id"], "category": case["category"], "ok": res.ok, "rounds": res.rounds,
            "decision_correct": res.ok == exp["ok"], "errors_round1": res.attempts[0]["errors"] if res.attempts else []}
     out["round1_ok"] = not out["errors_round1"]
-    if "round1_ok" in exp:
+    # "第 1 轮应当出错"是脚本化 Mock 的行为;真实模型第 1 轮就做对了是好事,不能算护栏失败。
+    # 所以对真实模型,只有它第 1 轮确实出错时才评估"护栏有没有拦住"。
+    scripted = planner.llm.provider == "mock"
+    if "round1_ok" in exp and (scripted or not out["round1_ok"]):
         out["round1_as_expected"] = out["round1_ok"] == exp["round1_ok"]
-    if "round1_error_contains" in exp:
+    if "round1_error_contains" in exp and (scripted or not out["round1_ok"]):
         out["guardrail_caught"] = any(exp["round1_error_contains"] in e for e in out["errors_round1"])
     out["unsafe_submitted"] = bool((res.ok and not exp["ok"]) or (res.ok and res.spec and not _invariants_ok(res.spec)))
     if res.ok and res.spec:
@@ -114,11 +117,14 @@ def main(argv: list[str] | None = None) -> int:
         llm = TracedLLM(make_llm(), eng)
         planner = Planner(llm, eng)
         t0 = time.time()
+        # 带 [mock:xxx] 的用例是用来驱动 Mock 脚本的,真实模型看不懂这个标记,评它没有意义
+        skipped = [] if llm.provider == "mock" else [c["id"] for c in cases if "[mock:" in c["request"]]
+        cases = [c for c in cases if c["id"] not in skipped]
         results = [run_case(planner, c) for _ in range(a.repeat) for c in cases]
         summary = summarize(results)
         usage = llm_usage_summary(eng)
         report = {"llm": f"{llm.provider}/{llm.model}", "repeat": a.repeat, "elapsed_s": round(time.time() - t0, 2),
-                  "summary": summary, "llm_usage": usage, "results": results}
+                  "skipped_mock_only_cases": skipped, "summary": summary, "llm_usage": usage, "results": results}
         if llm.provider == "mock":
             report["WARNING"] = "结果来自 MockLLM(脚本化),只能说明系统管线与护栏正确,不代表真实模型水平"
         print(json.dumps({k: v for k, v in report.items() if k != "results"}, ensure_ascii=False, indent=2))

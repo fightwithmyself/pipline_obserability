@@ -91,6 +91,12 @@ class StepContext:
         self.outputs[name] = name
         return p
 
+    def output_path(self, name: str) -> Path:
+        """登记一个产物并返回应写入的路径(适合直接写入大文件,避免先读进内存)。"""
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.outputs[name] = name
+        return self.out_dir / name
+
     # ---- 故障注入(MOCK 用,不参与缓存 key)
     def _apply_chaos(self, p: float) -> None:
         c = self.chaos

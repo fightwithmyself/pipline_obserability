@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -23,7 +24,34 @@ from .models import ErrorKind
 from .stepkit import StepContext, StepError
 
 
+def _watch_parent_win() -> None:
+    """Windows:轮询管道状态,而不是阻塞读。
+
+    阻塞在 os.read(0) 的线程会长期占着 C 运行时对 fd 0 的锁;步骤里 import numpy 这类库时,
+    初始化代码一旦碰到 stdin 就会与它死锁(实测:import numpy 永远不返回,步骤被判 STALL)。
+    PeekNamedPipe 直接问操作系统句柄:父进程退出/关闭管道时返回失败,不占 CRT 的锁。
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                                  ctypes.POINTER(wintypes.DWORD)]
+    k32.PeekNamedPipe.restype = wintypes.BOOL
+    handle = msvcrt.get_osfhandle(0)
+    avail = wintypes.DWORD(0)
+    try:
+        while k32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None):
+            time.sleep(0.2)
+    except Exception:
+        pass
+    os._exit(1)      # 管道断开 = 父进程已死/关闭
+
+
 def _watch_parent() -> None:
+    if sys.platform == "win32":
+        return _watch_parent_win()
     try:
         while os.read(0, 1024):     # 直接读 fd,不经过带锁的 BufferedReader(否则解释器退出时会死锁)
             pass
@@ -39,7 +67,10 @@ def main(argv: list[str]) -> int:
     threading.Thread(target=_watch_parent, daemon=True).start()
 
     from .steps import REGISTRY
-    from .steps import animation  # noqa: F401  注册 MOCK 步骤
+    from .steps import animation  # noqa: F401  注册 MOCK 步骤(含通用的 publish)
+    if str(job["type"]).startswith("fp_"):
+        # 序列帧的真实步骤依赖 numpy/Pillow,导入有成本:只在需要时加载,不拖慢其他步骤的子进程启动
+        from .steps import frames  # noqa: F401
 
     ctx = StepContext(job, real_out)
     try:

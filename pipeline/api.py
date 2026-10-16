@@ -4,8 +4,9 @@
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
@@ -15,8 +16,9 @@ from .agent.diagnosis import DiagnosisAgent
 from .agent.llm import TracedLLM, list_llm_calls, llm_usage_summary, make_llm
 from .agent.planner import Planner, get_plan, list_plans
 from .engine import Engine, EngineError, InvalidAction, NotFound
+from .media import MediaError, assess_video
 from .models import RetryPolicy, SpecError, TaskSpec
-from .templates import animation_swap_task
+from .templates import FRAME_INJECT_PRESETS, animation_swap_task, frame_pipeline_task
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -37,6 +39,21 @@ class AnimationTaskRequest(BaseModel):
     base_delay: float = Field(1.0, ge=0)
     chaos: dict[str, dict[str, Any]] | None = None
     request: str | None = None
+
+
+MEDIA_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+
+class FrameTaskRequest(BaseModel):
+    name: str = "frame-pipeline"
+    source: str                                   # 素材目录下的文件名,不接受路径
+    chunks: int = Field(4, ge=1, le=16)
+    require_approval: bool = False
+    qc_fail: bool = False
+    inject: Literal["transient", "crash", "hang"] | None = None
+    stall_timeout_s: float = Field(60.0, gt=0)
+    max_attempts: int = Field(3, ge=1, le=20)
+    base_delay: float = Field(1.0, ge=0)
 
 
 class ApprovalRequest(BaseModel):
@@ -102,6 +119,51 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
         except ValueError as e:
             raise HTTPException(422, str(e))
         tid, created = eng.submit(spec, idempotency_key=idempotency_key, request=req.request)
+        return {"id": tid, "created": created}
+
+    # ------------------------------------------------------------ 序列帧流水线(真实处理)
+    def media_dir() -> Path:
+        return Path(os.environ.get("PIPELINE_MEDIA_DIR", str(WEB_DIR.parent / "samples")))
+
+    def media_path(name: str) -> Path:
+        # 只接受素材目录下的"纯文件名":拒绝路径分隔符/上级目录/隐藏与下划线开头的临时文件
+        if not name or Path(name).name != name or name.startswith((".", "_")):
+            raise HTTPException(422, "source 只能是素材目录下的文件名")
+        p = media_dir() / name
+        if not p.is_file():
+            raise HTTPException(404, f"素材不存在: {name}")
+        return p
+
+    @app.get("/api/media")
+    def list_media():
+        d = media_dir()
+        if not d.is_dir():
+            return []
+        return [{"name": p.name, "size_mb": round(p.stat().st_size / 1048576, 2)}
+                for p in sorted(d.iterdir())
+                if p.is_file() and p.suffix.lower() in MEDIA_EXTS and not p.name.startswith(("_", "."))]
+
+    @app.get("/api/media/assess")
+    def assess_media(name: str):
+        """素材检测(与流水线 probe 步骤同一个函数)。几秒钟:需要解码抽样。"""
+        try:
+            return assess_video(media_path(name))
+        except MediaError as e:
+            return {"ok": False, "reasons": [str(e)], "warnings": [], "info": None, "metrics": None}
+
+    @app.post("/api/tasks/frames", status_code=201)
+    def submit_frames(req: FrameTaskRequest, idempotency_key: str | None = Header(default=None),
+                      eng: Engine = Depends(get_engine)):
+        try:
+            spec = frame_pipeline_task(
+                req.name, source=str(media_path(req.source)), chunks=req.chunks,
+                require_approval=req.require_approval, qc_fail=req.qc_fail,
+                stall_timeout_s=req.stall_timeout_s,
+                chaos=FRAME_INJECT_PRESETS[req.inject] if req.inject else None,
+                retry=RetryPolicy(max_attempts=req.max_attempts, base_delay=req.base_delay, max_delay=30, jitter=0.2))
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        tid, created = eng.submit(spec, idempotency_key=idempotency_key)
         return {"id": tid, "created": created}
 
     @app.post("/api/tasks", status_code=201)

@@ -59,6 +59,26 @@ def cmd_submit(a) -> int:
     return 0
 
 
+def cmd_submit_frames(a) -> int:
+    from .media import MediaError
+    from .templates import FRAME_INJECT_PRESETS, frame_pipeline_task
+    eng = Engine(a.data)
+    chaos = json.loads(a.chaos) if a.chaos else None
+    if a.inject:
+        chaos = {**(chaos or {}), **FRAME_INJECT_PRESETS[a.inject]}
+    try:
+        spec = frame_pipeline_task(
+            a.name, source=a.source, chunks=a.chunks, require_approval=a.approval, qc_fail=a.qc_fail,
+            stall_timeout_s=a.stall_timeout, chaos=chaos,
+            retry=RetryPolicy(max_attempts=a.max_attempts, base_delay=a.base_delay, max_delay=30, jitter=0.2))
+    except (ValueError, MediaError) as e:
+        print(f"提交失败: {e}", file=sys.stderr)
+        return 2
+    tid, created = eng.submit(spec, idempotency_key=a.key)
+    print(tid if created else f"{tid} (已存在,幂等返回)")
+    return 0
+
+
 def _fmt_ts(ts) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "-"
 
@@ -123,6 +143,21 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--inject", choices=sorted(INJECT_PRESETS), help="故障注入预设:瞬时失败/进程崩溃/卡死")
     m.add_argument("--key", help="幂等键")
     m.set_defaults(fn=cmd_submit)
+
+    f = sub.add_parser("submit-frames", help="提交序列帧处理任务(拆帧→抠背景→超分→补帧→合成,真实处理)")
+    f.add_argument("--source", required=True, help="本地视频文件路径(先用 python -m pipeline.media assess 检测)")
+    f.add_argument("--name", default="frame-pipeline")
+    f.add_argument("--chunks", type=int, default=4)
+    f.add_argument("--stall-timeout", type=float, default=60.0)
+    f.add_argument("--max-attempts", type=int, default=3)
+    f.add_argument("--base-delay", type=float, default=1.0)
+    f.add_argument("--approval", action="store_true")
+    f.add_argument("--qc-fail", action="store_true")
+    f.add_argument("--chaos", help='JSON,如 {"matte_1":{"crash":{"at":0.5,"on_attempts":[1]}}}')
+    from .templates import FRAME_INJECT_PRESETS
+    f.add_argument("--inject", choices=sorted(FRAME_INJECT_PRESETS), help="故障注入预设")
+    f.add_argument("--key", help="幂等键")
+    f.set_defaults(fn=cmd_submit_frames)
 
     st = sub.add_parser("status")
     st.add_argument("task_id", nargs="?")

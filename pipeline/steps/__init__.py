@@ -14,5 +14,5 @@ def register(name: str):
 
 
 def known_step_types() -> set[str]:
-    from . import animation  # noqa: F401  触发注册
+    from . import animation, frames  # noqa: F401  触发注册
     return set(REGISTRY) | {"human_approval"}

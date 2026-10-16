@@ -98,7 +98,8 @@ def publish(ctx: StepContext) -> None:
     外部"素材库"用 data/published/<key>.json 模拟,O_EXCL 创建 = 对端的幂等去重。
     """
     ctx.progress(0.0, "publishing")
-    final_sha = ctx.input_sha("mux", "final.bin")
+    # 默认读 mux/final.bin(角色替换模板);序列帧模板通过参数指向 assemble/final.mp4
+    final_sha = ctx.input_sha(ctx.params.get("final_dep", "mux"), ctx.params.get("final_name", "final.bin"))
     target = ctx.params.get("target", "asset-library")
     pub_key = _sha(f"{final_sha}|{target}".encode())
     reg_dir = ctx.data_dir / "published"

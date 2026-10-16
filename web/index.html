@@ -64,7 +64,25 @@
 <main>
   <aside>
     <div class="panel" style="margin-bottom:12px">
-      <h2>提交演示任务(角色替换)</h2>
+      <h2>序列帧处理(真实:拆帧→抠背景→超分→补帧→合成)</h2>
+      <label>素材(samples/ 目录)<select id="m_src" onchange="$('m_report').innerHTML=''"></select></label>
+      <div style="display:flex;gap:6px;margin:4px 0"><button onclick="assessMedia()">检测素材</button>
+        <button onclick="loadMedia()">刷新列表</button></div>
+      <div id="m_report" style="font-size:12px;margin-bottom:6px"></div>
+      <label>分块数 chunks<input type="number" id="m_chunks" value="4" min="1" max="16"></label>
+      <label>故障注入
+        <select id="m_inject">
+          <option value="">无</option>
+          <option value="transient">matte_0 瞬时失败 2 次(重试)</option>
+          <option value="crash">matte_1 进程崩溃(从检查点继续)</option>
+          <option value="hang">upscale_0 卡死(无进展 → 强杀)</option>
+        </select></label>
+      <label><input type="checkbox" id="m_approval"> 发布前需要人工审批</label>
+      <div style="margin-top:6px"><button onclick="submitFrames()">提交</button></div>
+      <div id="m_msg" class="muted" style="margin-top:4px"></div>
+    </div>
+    <div class="panel" style="margin-bottom:12px">
+      <h2>提交演示任务(角色替换,MOCK)</h2>
       <label>素材 source(相同 source 会命中缓存)<input type="text" id="f_source" value="demo.mp4"></label>
       <label>分块数 chunks<input type="number" id="f_chunks" value="4" min="1" max="16"></label>
       <label>故障注入
@@ -130,6 +148,38 @@ async function submitTask() {
     $('submitmsg').textContent = '已提交 ' + r.id; selTask = r.id; selStep = null; evs = []; evAfter = 0;
     refresh();
   } catch (e) { $('submitmsg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
+}
+
+async function loadMedia() {
+  try {
+    const list = await api('/api/media');
+    $('m_src').innerHTML = list.length
+      ? list.map(m => `<option value="${esc(m.name)}">${esc(m.name)} (${m.size_mb} MB)</option>`).join('')
+      : '<option value="">(samples/ 目录下没有视频)</option>';
+  } catch (e) { $('m_msg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
+}
+async function assessMedia() {
+  const name = $('m_src').value; if (!name) return;
+  $('m_report').textContent = '检测中…';
+  try {
+    const r = await api('/api/media/assess?name=' + encodeURIComponent(name));
+    const i = r.info, m = r.metrics;
+    let h = `<b style="color:var(--${r.ok ? 'ok' : 'fail'})">${r.ok ? '✔ 合适' : '✘ 不合适'}</b>`;
+    if (i) h += `<div class="muted">${i.width}x${i.height} ${i.fps}fps ${i.duration_s}s ≈${i.frames_est}帧</div>`;
+    if (m) h += `<div class="muted">背景稳定 ${(m.static_bg_ratio*100).toFixed(0)}% · 前景占比 ${(m.fg_ratio_mean*100).toFixed(1)}%</div>`;
+    (r.reasons||[]).forEach(x => h += `<div class="err">✘ ${esc(x)}</div>`);
+    (r.warnings||[]).forEach(x => h += `<div class="muted">! ${esc(x)}</div>`);
+    $('m_report').innerHTML = h;
+  } catch (e) { $('m_report').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
+}
+async function submitFrames() {
+  const body = { source: $('m_src').value, chunks: +$('m_chunks').value, require_approval: $('m_approval').checked,
+                 inject: $('m_inject').value || null, base_delay: 1 };
+  if (body.inject === 'hang') body.stall_timeout_s = 8;
+  try {
+    const r = await api('/api/tasks/frames', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+    $('m_msg').textContent = '已提交 ' + r.id; selTask = r.id; selStep = null; evs = []; evAfter = 0; refresh();
+  } catch (e) { $('m_msg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
 }
 
 async function submitPlan() {
@@ -304,7 +354,7 @@ async function refresh() {
     }
   } catch (e) { console.warn(e); }
 }
-refresh(); setInterval(refresh, 1000);
+loadMedia(); refresh(); setInterval(refresh, 1000);
 </script>
 </body>
 </html>

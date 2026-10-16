@@ -45,17 +45,24 @@ def draw_frame(bg: np.ndarray, t: float, w: int, h: int, *, pan_after: float | N
 
 
 def make_clip(dest: str | Path, *, w: int = 320, h: int = 180, fps: int = 12, secs: float = 5.0,
-              pan_after: float | None = None, subject: bool = True) -> Path:
+              pan_after: float | None = None, subject: bool = True, audio: bool = False,
+              cut_at: float | None = None) -> Path:
+    """cut_at: 从该时刻起换成另一个背景(模拟镜头切换);audio: 加一条正弦音轨。"""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="clipgen_"))
     try:
         bg = _background(w, h)
+        bg2 = _background(w, h, seed=99)
         n = int(round(fps * secs))
         for i in range(n):
-            draw_frame(bg, i / fps, w, h, pan_after=pan_after, subject=subject).save(tmp / f"{i:05d}.png")
-        run_ffmpeg(["-framerate", str(fps), "-i", str(tmp / "%05d.png"), "-c:v", "libx264", "-crf", "16",
-                    "-pix_fmt", "yuv420p", str(dest)])
+            t = i / fps
+            b = bg2 if (cut_at is not None and t >= cut_at) else bg
+            draw_frame(b, t, w, h, pan_after=pan_after, subject=subject).save(tmp / f"{i:05d}.png")
+        args = ["-framerate", str(fps), "-i", str(tmp / "%05d.png")]
+        if audio:
+            args += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={secs}", "-c:a", "aac", "-shortest"]
+        run_ffmpeg([*args, "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", str(dest)])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return dest

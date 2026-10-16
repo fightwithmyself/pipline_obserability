@@ -59,6 +59,10 @@ class StepContext:
     def note(self, k: str, v) -> None:
         self._send({"t": "note", "k": k, "v": v})
 
+    def item(self, key: str, status: str, **data) -> None:
+        """上报一个工作项(如一个关键帧)的状态,父进程写入 items 表供观测。不影响恢复语义。"""
+        self._send({"t": "item", "k": key, "status": status, "data": data})
+
     # ---- 辅助
     def sleep(self, seconds: float) -> None:
         time.sleep(max(0.0, seconds * self.time_scale))

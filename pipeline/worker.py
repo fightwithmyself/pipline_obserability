@@ -192,6 +192,10 @@ class Worker:
                         lost = True
                         break
                     last_hb = now
+                elif t == "item":
+                    # 工作项账本(观测用):被 fencing 拒绝只说明这次 attempt 已过期,忽略即可
+                    last_progress = now
+                    eng.upsert_item(sid, att, str(msg["k"]), str(msg["status"]), msg.get("data"))
                 elif t == "note":
                     notes[msg["k"]] = msg["v"]
                 elif t == "done":

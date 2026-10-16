@@ -59,84 +59,48 @@ def cmd_submit(a) -> int:
     return 0
 
 
-def cmd_submit_frames(a) -> int:
-    from .media import MediaError
-    from .templates import FRAME_INJECT_PRESETS, frame_pipeline_task
+def cmd_submit_style(a) -> int:
+    """提交主流水线任务:素材 → 逐帧风格化 → 成品视频。provider=mock 不花钱;provider=ark 调用豆包(密钥在环境变量)。"""
+    from .templates import DEFAULT_PRICE_CNY, frame_style_inject_presets, frame_style_task
     eng = Engine(a.data)
     chaos = json.loads(a.chaos) if a.chaos else None
     if a.inject:
-        chaos = {**(chaos or {}), **FRAME_INJECT_PRESETS[a.inject]}
+        chaos = {**(chaos or {}), **frame_style_inject_presets(a.chunks)[a.inject]}
+    if a.provider == "ark" and not os.environ.get("ARK_API_KEY"):
+        print("提示:还没有设置环境变量 ARK_API_KEY,worker 运行时会在工序 3 立即失败(不会产生费用)", file=sys.stderr)
     try:
-        spec = frame_pipeline_task(
-            a.name, source=a.source, chunks=a.chunks, require_approval=a.approval, qc_fail=a.qc_fail,
-            stall_timeout_s=a.stall_timeout, chaos=chaos,
-            retry=RetryPolicy(max_attempts=a.max_attempts, base_delay=a.base_delay, max_delay=30, jitter=0.2))
-    except (ValueError, MediaError) as e:
-        print(f"提交失败: {e}", file=sys.stderr)
-        return 2
-    tid, created = eng.submit(spec, idempotency_key=a.key)
-    print(tid if created else f"{tid} (已存在,幂等返回)")
-    return 0
-
-
-def cmd_submit_kling(a) -> int:
-    from .templates import kling_video_task
-    eng = Engine(a.data)
-    try:
-        spec = kling_video_task(a.name, prompt=a.prompt, mode=a.mode, duration=a.duration, audio=a.audio,
-                                aspect_ratio=a.aspect_ratio, poll_interval_s=a.poll_interval, max_wait_s=a.max_wait,
-                                retry=RetryPolicy(max_attempts=a.max_attempts, base_delay=2.0, max_delay=30, jitter=0.2))
+        spec = frame_style_task(
+            a.name, source=a.source, prompt=a.prompt, provider=a.provider, model=a.model, reference=a.reference,
+            chunks=a.chunks, stride=a.stride, max_gap=a.max_gap, target_height=a.height, price_cny=a.price,
+            budget_cny=a.budget, concurrency=a.concurrency, on_reject=a.on_reject,
+            require_approval=a.approval, chaos=chaos,
+            retry=RetryPolicy(max_attempts=a.max_attempts, base_delay=a.base_delay, max_delay=60, jitter=0.2))
     except ValueError as e:
         print(f"提交失败: {e}", file=sys.stderr)
         return 2
-    from .steps.kling import PRICE_CNY_PER_S
-    est = PRICE_CNY_PER_S[(a.mode, a.audio)] * a.duration
-    print(f"预估费用 ≈ {est:.2f} 元(按文档标价 {PRICE_CNY_PER_S[(a.mode, a.audio)]} 元/秒 × {a.duration} 秒;失败不计费)")
+    price = DEFAULT_PRICE_CNY if a.price is None else a.price
+    print(f"provider={a.provider} 单价按 {price} 元/张估算,预算上限 {a.budget} 元;关键帧数在工序 2 之后才知道,"
+          f"超预算会在调用接口之前就失败")
     tid, created = eng.submit(spec, idempotency_key=a.key)
     print(tid if created else f"{tid} (已存在,幂等返回)")
     return 0
 
 
-def cmd_submit_style(a) -> int:
-    from .media import MediaError, probe_video
-    from .steps.vst import PRICE_CNY_PER_S, STYLE_NAMES
-    from .templates import style_transform_task
+def cmd_frames(a) -> int:
+    """打印逐帧账本与用量(与 Dashboard 的帧网格同一份数据)。"""
     eng = Engine(a.data)
-    try:
-        spec = style_transform_task(
-            a.name, source=a.source, style=a.style, min_len=a.min_len, video_fps=a.video_fps, use_sr=a.use_sr,
-            review_model=a.review_model, poll_interval_s=a.poll_interval, max_wait_s=a.max_wait,
-            retry=RetryPolicy(max_attempts=a.max_attempts, base_delay=2.0, max_delay=30, jitter=0.2))
-        dur = probe_video(a.source)["duration_s"]
-    except (ValueError, MediaError) as e:
-        print(f"提交失败: {e}", file=sys.stderr)
-        return 2
-    est = PRICE_CNY_PER_S[a.min_len] * dur
-    print(f"风格: {STYLE_NAMES[a.style]};素材时长 {dur}s;预估上限 ≈ {est:.2f} 元"
-          f"(按标价 {PRICE_CNY_PER_S[a.min_len]} 元/秒 × 输出时长;该模型有 600 秒免费额度,额度内不扣费;失败不计费)")
-    tid, created = eng.submit(spec, idempotency_key=a.key)
-    print(tid if created else f"{tid} (已存在,幂等返回)")
-    return 0
-
-
-def cmd_kling_report(a) -> int:
-    """按轮打印外部视频生成任务的观测记录:每次尝试、每轮轮询、用量与费用估算。"""
-    eng = Engine(a.data)
-    t = eng.get_task(a.task_id)
-    print(f"任务 {t['id']}  {t['name']}  {t['status']}")
-    for att in eng.get_attempts(a.task_id, "generate"):
-        notes = att.get("notes") or {}
-        print(f"\n== 第 {att['attempt_no']} 次尝试  {att['outcome']}  耗时 {att.get('duration', 0):.1f}s  "
-              f"{(att.get('error_kind') or '')} {(att.get('error_msg') or '')[:140]}")
-        print(f"   本次是否提交了新的外部任务: {notes.get('submitted_this_attempt')}   "
-              f"外部 task_id: {notes.get('external_task_id') or notes.get('resumed_external_task')}")
-        for k in sorted(k for k in notes if k.startswith("poll_")):
-            r = notes[k]
-            print(f"   轮询 {k[5:]}  状态={r['status']:<10} 已等待={r['elapsed_s']:>6}s  "
-                  f"token={r['tokens']}  用量(usage)={r['usage']}")
-        for k in ("usage", "cost_cny_est", "video_info", "video_bytes", "external_failure"):
-            if k in notes:
-                print(f"   {k}: {notes[k]}")
+    items = eng.list_items(a.task_id, prefix="stylize_")
+    items.sort(key=lambda x: x.get("idx", 0))
+    by: dict[str, int] = {}
+    for it in items:
+        by[it["status"]] = by.get(it["status"], 0) + 1
+        if a.all or it["status"] not in ("DONE",) or it.get("maybe_duplicated") or it.get("calls", 0) > 1:
+            print(f"帧 {it['idx']:>6} [{it['step_key']}] {it['status']:<9} calls={it.get('calls')} billed={it.get('billed')} "
+                  f"maybe_billed={it.get('maybe_billed')} cached={it.get('cached')} resumed={it.get('resumed')} "
+                  f"{(it.get('error') or '')[:80]}")
+    cost = sum(float(i.get("cost_cny_est") or 0) for i in items)
+    extra = sum(float(i.get("cost_maybe_extra_cny_est") or 0) for i in items)
+    print(f"共 {len(items)} 帧 {by};费用估算 ≈ {cost:.2f} 元(另有可能多付 ≈ {extra:.2f} 元;以平台账单为准)")
     return 0
 
 
@@ -205,51 +169,34 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--key", help="幂等键")
     m.set_defaults(fn=cmd_submit)
 
-    f = sub.add_parser("submit-frames", help="提交序列帧处理任务(拆帧→抠背景→超分→补帧→合成,真实处理)")
-    f.add_argument("--source", required=True, help="本地视频文件路径(先用 python -m pipeline.media assess 检测)")
-    f.add_argument("--name", default="frame-pipeline")
-    f.add_argument("--chunks", type=int, default=4)
-    f.add_argument("--stall-timeout", type=float, default=60.0)
-    f.add_argument("--max-attempts", type=int, default=3)
-    f.add_argument("--base-delay", type=float, default=1.0)
-    f.add_argument("--approval", action="store_true")
-    f.add_argument("--qc-fail", action="store_true")
-    f.add_argument("--chaos", help='JSON,如 {"matte_1":{"crash":{"at":0.5,"on_attempts":[1]}}}')
-    from .templates import FRAME_INJECT_PRESETS
-    f.add_argument("--inject", choices=sorted(FRAME_INJECT_PRESETS), help="故障注入预设")
-    f.add_argument("--key", help="幂等键")
-    f.set_defaults(fn=cmd_submit_frames)
-
-    k = sub.add_parser("submit-kling", help="提交一个外部视频生成任务(可灵 omni,按秒计费,会花钱)")
-    k.add_argument("--prompt", required=True)
-    k.add_argument("--name", default="kling-video")
-    k.add_argument("--mode", choices=["std", "pro", "4k"], default="std", help="std=720P(最便宜) pro=1080P")
-    k.add_argument("--duration", type=int, default=3, help="秒,3..15;直接决定费用")
-    k.add_argument("--audio", action="store_true", help="生成有声视频(更贵)")
-    k.add_argument("--aspect-ratio", default="16:9")
-    k.add_argument("--poll-interval", type=float, default=15.0)
-    k.add_argument("--max-wait", type=float, default=900.0)
-    k.add_argument("--max-attempts", type=int, default=3)
-    k.add_argument("--key", help="幂等键")
-    k.set_defaults(fn=cmd_submit_kling)
-
-    sv = sub.add_parser("submit-style", help="提交视频风格重绘任务链(百炼 video-style-transform,按输出秒数计费)")
-    sv.add_argument("--source", required=True, help="本地视频;先经 vst_probe 检查是否满足接口要求")
-    sv.add_argument("--name", default="style-transform")
-    sv.add_argument("--style", type=int, default=0, help="0=日式漫画(默认) 1=美式 2=清新 3=3D卡通 4=国风卡通 5=纸艺 6=简易插画 7=水墨")
-    sv.add_argument("--min-len", type=int, choices=[540, 720], default=540, help="输出短边;540P 0.2元/秒,720P 0.5元/秒")
-    sv.add_argument("--video-fps", type=int, default=15)
-    sv.add_argument("--use-sr", action="store_true", help="超分(540P 开启后可达 1080P 画质,仍按 540P 计费)")
-    sv.add_argument("--review-model", default="qwen3.8-omni-flash")
-    sv.add_argument("--poll-interval", type=float, default=10.0)
-    sv.add_argument("--max-wait", type=float, default=900.0)
+    sv = sub.add_parser("submit-style", help="提交主流水线:素材 → 逐帧风格化(豆包) → 成品视频")
+    sv.add_argument("--source", required=True, help="本地视频文件")
+    sv.add_argument("--prompt", required=True, help="风格/替换指令,如:日系动漫风格,保持人物与动作不变")
+    sv.add_argument("--name", default="anime-style")
+    sv.add_argument("--provider", choices=["mock", "ark"], default="mock", help="mock=离线替身(不花钱);ark=豆包(花钱)")
+    sv.add_argument("--model", help="provider=ark 时必填:方舟控制台里的模型 ID 或 Endpoint ID")
+    sv.add_argument("--reference", help="锚点/人物参考图(可选)")
+    sv.add_argument("--chunks", type=int, default=4)
+    sv.add_argument("--stride", type=int, default=6, help="关键帧间隔(帧);越大越省钱、补间越多")
+    sv.add_argument("--max-gap", type=int, default=24)
+    sv.add_argument("--height", type=int, default=1080, help="标准化目标高度")
+    sv.add_argument("--price", type=float, help="单张价格(元),默认 0.12;只用于估算与预算保护")
+    sv.add_argument("--budget", type=float, default=20.0, help="预算上限(元),必须设置")
+    sv.add_argument("--concurrency", type=int, default=4)
+    sv.add_argument("--on-reject", choices=["passthrough", "fail"], default="passthrough")
+    sv.add_argument("--approval", action="store_true")
     sv.add_argument("--max-attempts", type=int, default=3)
+    sv.add_argument("--base-delay", type=float, default=2.0)
+    sv.add_argument("--chaos", help="JSON 故障注入")
+    sv.add_argument("--inject", choices=["transient", "crash", "moderation", "response_lost", "rate_limit"],
+                    help="故障注入预设(mock)")
     sv.add_argument("--key", help="幂等键")
     sv.set_defaults(fn=cmd_submit_style)
 
-    kr = sub.add_parser("kling-report", help="按轮打印外部视频生成任务的观测记录")
-    kr.add_argument("task_id")
-    kr.set_defaults(fn=cmd_kling_report)
+    fr = sub.add_parser("frames", help="打印逐帧账本与用量")
+    fr.add_argument("task_id")
+    fr.add_argument("--all", action="store_true", help="包括正常完成的帧")
+    fr.set_defaults(fn=cmd_frames)
 
     st = sub.add_parser("status")
     st.add_argument("task_id", nargs="?")

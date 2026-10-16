@@ -1,5 +1,8 @@
 # 方案 V2:面向 Agent 应用开发岗位的版本
 
+> **现状提醒**:本文描述的 Planner/诊断 Agent **只覆盖旧的 MOCK 动画 DAG**(`animation_swap_task`),
+> **尚未接入现行的逐帧风格化流水线**(见 `DESIGN.md` 第 15 节)。下面的评测结果也都是在旧 DAG + MockLLM 上得到的。
+
 > 本文在 `DESIGN.md`(执行引擎设计)之上增加 **Agent 层**。执行引擎部分不变,仍是评分的核心;
 > Agent 层用来体现"大模型 Agent 应用开发"的能力。
 

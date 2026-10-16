@@ -390,6 +390,41 @@ class Engine:
                     (_j(data), now, now + lease_ttl, step_id, attempt_no, S.RUNNING))
             return cur.rowcount == 1
 
+    def upsert_item(self, step_id: int, attempt_no: int, item_key: str, status: str, data: dict | None) -> bool:
+        """写入/更新一个工作项(如一个关键帧)。受 fencing 保护:旧 attempt 的更新被忽略。
+
+        data 做浅合并:后续消息只需带变化的字段。这张表是派生的观测视图,不参与恢复决策。
+        """
+        now = self.clock()
+        with tx(self.conn):
+            row = self.conn.execute("SELECT task_id,key,attempt_no,status FROM steps WHERE id=?",
+                                    (step_id,)).fetchone()
+            if row is None or row["status"] != S.RUNNING or row["attempt_no"] != attempt_no:
+                return False
+            old = self.conn.execute("SELECT data FROM items WHERE task_id=? AND step_key=? AND item_key=?",
+                                    (row["task_id"], row["key"], item_key)).fetchone()
+            merged = {**(_unj(old["data"]) if old and old["data"] else {}), **(data or {})}
+            self.conn.execute(
+                "INSERT INTO items(task_id,step_key,item_key,status,data,updated_at) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(task_id,step_key,item_key) DO UPDATE SET status=excluded.status,"
+                " data=excluded.data, updated_at=excluded.updated_at",
+                (row["task_id"], row["key"], item_key, status, _j(merged), now))
+            return True
+
+    def list_items(self, task_id: str, step_key: str | None = None, prefix: str | None = None) -> list[dict]:
+        q = "SELECT * FROM items WHERE task_id=?"
+        args: list[Any] = [task_id]
+        if step_key:
+            q += " AND step_key=?"
+            args.append(step_key)
+        if prefix:
+            q += " AND step_key LIKE ?"
+            args.append(prefix + "%")
+        q += " ORDER BY item_key, step_key"
+        return [{"step_key": r["step_key"], "item_key": r["item_key"], "status": r["status"],
+                 "updated_at": r["updated_at"], **(_unj(r["data"]) or {})}
+                for r in self.conn.execute(q, args).fetchall()]
+
     def complete(self, step_id: int, attempt_no: int, outputs: dict[str, dict],
                  notes: dict | None = None) -> bool:
         """提交成功结果。fencing:attempt_no 不匹配或不再 RUNNING → 拒绝并留痕。"""

@@ -117,6 +117,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, seq);
 
+-- 步骤内的"工作项"账本(如每个关键帧一行)。这是**派生的只读视图**:恢复所依赖的真相在步骤的
+-- work_dir 里(逐帧文件 + 逐帧账本),本表只服务于观测("第 120 张现在怎么样了")。
+-- 只由 worker 在 fencing 通过后写入;步骤子进程不直接访问数据库。
+CREATE TABLE IF NOT EXISTS items (
+    task_id    TEXT NOT NULL,
+    step_key   TEXT NOT NULL,
+    item_key   TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    data       TEXT,                       -- JSON:calls / usage / error / cached / degraded ...
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (task_id, step_key, item_key)
+);
+
 CREATE TABLE IF NOT EXISTS workers (
     id           TEXT PRIMARY KEY,
     resources    TEXT NOT NULL,

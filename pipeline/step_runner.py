@@ -68,13 +68,9 @@ def main(argv: list[str]) -> int:
 
     from .steps import REGISTRY
     from .steps import animation  # noqa: F401  注册 MOCK 步骤(含通用的 publish)
-    if str(job["type"]).startswith("fp_"):
-        # 序列帧的真实步骤依赖 numpy/Pillow,导入有成本:只在需要时加载,不拖慢其他步骤的子进程启动
-        from .steps import frames  # noqa: F401
-    if job["type"] == "kling_video":
-        from .steps import kling  # noqa: F401
-    if str(job["type"]).startswith("vst_"):
-        from .steps import vst  # noqa: F401
+    if str(job["type"]).startswith("an_"):
+        # 主流水线的步骤依赖 numpy/Pillow,导入有成本:只在需要时加载,不拖慢其他步骤的子进程启动
+        from .steps import anime  # noqa: F401
 
     ctx = StepContext(job, real_out)
     try:

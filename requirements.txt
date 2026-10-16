@@ -1,5 +1,5 @@
 # 以下版本为开发与测试时实际使用的版本。langgraph / mcp 迭代很快(mcp 2.x 已把 FastMCP 改名为 MCPServer),建议锁版本。
-# 执行引擎(pipeline/engine.py 等)只依赖 Python 标准库;下面的依赖用于接口层、Agent 层与序列帧处理。
+# 执行引擎(pipeline/engine.py 等)只依赖 Python 标准库;下面的依赖用于接口层、Agent 层与动漫逐帧流水线。
 fastapi==0.143.0
 uvicorn==0.54.0
 pydantic==2.14.1
@@ -8,8 +8,12 @@ langgraph==1.2.15
 langgraph-checkpoint-sqlite==3.1.2
 mcp==2.3.0
 
-# 序列帧处理流水线(pipeline/steps/frames.py、pipeline/media.py)
+# 逐帧风格化流水线(pipeline/steps/anime.py、pipeline/media.py、pipeline/doubao.py)
+httpx==0.28.1
 numpy==2.4.6
 pillow==12.3.0
 # 自带 ffmpeg 二进制,免去手工安装;若已有系统 ffmpeg(在 PATH 或设置 FFMPEG_BIN)会优先使用系统的
 imageio-ffmpeg==0.6.0
+
+# 测试
+pytest==8.4.2

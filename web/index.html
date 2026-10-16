@@ -53,6 +53,14 @@
   .k-COMMIT_REJECTED,.k-FAIL_REJECTED,.k-CACHE_INVALID { color:var(--retry); }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   .muted { color:var(--dim); } .err { color:var(--fail); }
+  #framegrid { display:flex; flex-wrap:wrap; gap:3px; }
+  .fc { width:15px; height:15px; border-radius:3px; background:var(--pending); cursor:pointer; border:1px solid transparent; }
+  .fc.DONE { background:var(--ok); } .fc.cached { background:#0e7490; } .fc.DEGRADED { background:#a16207; }
+  .fc.FAILED { background:var(--fail); } .fc.INFLIGHT { background:var(--running); animation:pulse 1s infinite; }
+  .fc.RETRY { background:var(--retry); } .fc.PENDING { background:var(--pending); }
+  .fc.dup { border-color:#fff; } .fc.sel { outline:2px solid #fff; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--dim); margin-bottom:6px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:3px; vertical-align:-1px; }
   code { background:#0f1419; padding:0 4px; border-radius:3px; }
 </style>
 </head>
@@ -64,25 +72,36 @@
 <main>
   <aside>
     <div class="panel" style="margin-bottom:12px">
-      <h2>序列帧处理(真实:拆帧→抠背景→超分→补帧→合成)</h2>
-      <label>素材(samples/ 目录)<select id="m_src" onchange="$('m_report').innerHTML=''"></select></label>
-      <div style="display:flex;gap:6px;margin:4px 0"><button onclick="assessMedia()">检测素材</button>
-        <button onclick="loadMedia()">刷新列表</button></div>
-      <div id="m_report" style="font-size:12px;margin-bottom:6px"></div>
-      <label>分块数 chunks<input type="number" id="m_chunks" value="4" min="1" max="16"></label>
-      <label>故障注入
+      <h2>逐帧风格化(主流水线:6 道工序 + 质检)</h2>
+      <label>素材(samples/ 目录)<select id="m_src"></select></label>
+      <label>指令 prompt<input type="text" id="m_prompt" value="日系动漫风格,保持人物与动作不变,线条清晰"></label>
+      <label>provider
+        <select id="m_provider" onchange="$('m_model').disabled = this.value==='mock'">
+          <option value="mock">mock(离线替身,不花钱)</option>
+          <option value="ark">ark(豆包,花钱;需要环境变量 ARK_API_KEY)</option>
+        </select></label>
+      <label>模型 ID(provider=ark 时必填)<input type="text" id="m_model" disabled placeholder="方舟控制台里的模型 ID"></label>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px">
+        <label>分块数<input type="number" id="m_chunks" value="4" min="1" max="16"></label>
+        <label>抽帧间隔<input type="number" id="m_stride" value="6" min="1"></label>
+        <label>预算(元)<input type="number" id="m_budget" value="20" min="0.1" step="0.1"></label>
+      </div>
+      <label>故障注入(仅 mock)
         <select id="m_inject">
           <option value="">无</option>
-          <option value="transient">matte_0 瞬时失败 2 次(重试)</option>
-          <option value="crash">matte_1 进程崩溃(从检查点继续)</option>
-          <option value="hang">upscale_0 卡死(无进展 → 强杀)</option>
+          <option value="transient">stylize_0 首帧瞬时失败 2 次(帧内重试)</option>
+          <option value="rate_limit">stylize_0 首帧 429 用完重试(只重做这一帧)</option>
+          <option value="crash">stylize_0 进程崩溃(复用已完成的帧)</option>
+          <option value="response_lost">stylize_0 首帧响应丢失(可能多付一次)</option>
+          <option value="moderation">stylize_0 首帧被审核拒绝(降级)</option>
         </select></label>
       <label><input type="checkbox" id="m_approval"> 发布前需要人工审批</label>
-      <div style="margin-top:6px"><button onclick="submitFrames()">提交</button></div>
+      <div style="display:flex;gap:6px;margin-top:6px"><button onclick="submitStyle()">提交</button>
+        <button onclick="loadMedia()">刷新素材列表</button></div>
       <div id="m_msg" class="muted" style="margin-top:4px"></div>
     </div>
-    <div class="panel" style="margin-bottom:12px">
-      <h2>提交演示任务(角色替换,MOCK)</h2>
+    <details class="panel" style="margin-bottom:12px">
+      <summary style="cursor:pointer;color:var(--dim)">引擎演示:MOCK DAG(sleep + 确定性字节,用于展示故障矩阵)</summary>
       <label>素材 source(相同 source 会命中缓存)<input type="text" id="f_source" value="demo.mp4"></label>
       <label>分块数 chunks<input type="number" id="f_chunks" value="4" min="1" max="16"></label>
       <label>故障注入
@@ -98,9 +117,9 @@
       <div style="display:flex;gap:6px;margin-top:6px"><button onclick="submitTask()">提交</button>
         <button onclick="document.getElementById('f_source').value='clip-'+Math.floor(Math.random()*9999)+'.mp4'">随机素材</button></div>
       <div id="submitmsg" class="muted" style="margin-top:4px"></div>
-    </div>
+    </details>
     <div class="panel" style="margin-bottom:12px">
-      <h2>自然语言提交(Planner Agent)</h2>
+      <h2>自然语言提交(Planner Agent,目前只覆盖 MOCK DAG)</h2>
       <textarea id="nl" rows="3" style="width:100%;background:#0f1419;color:var(--txt);border:1px solid var(--line);border-radius:4px;padding:4px">把 demo.mp4 的主角换成红发女孩,分成 3 段,发布到测试库</textarea>
       <div class="muted" style="font-size:11px">试试:"……发布并且不用审批"(触发策略护栏→自动修复)</div>
       <div style="margin-top:6px"><button onclick="submitPlan()">规划并提交</button></div>
@@ -110,6 +129,10 @@
   </aside>
   <section>
     <div class="panel" id="detail"><span class="muted">← 选择一个任务</span></div>
+    <div class="grid2" id="framesrow" style="margin-top:12px;display:none">
+      <div class="panel"><h2>帧网格(工序 3:每格一个关键帧,点击查看源图与结果)</h2><div id="framegrid"></div><div id="frameview" style="margin-top:8px"></div></div>
+      <div class="panel"><h2>用量与费用(接口返回的用量 + 按标价估算)</h2><div id="usage" class="muted">-</div></div>
+    </div>
     <div class="grid2" style="margin-top:12px">
       <div class="panel"><h2>步骤详情(点击 DAG 节点)</h2><div id="stepinfo" class="muted">未选择步骤</div></div>
       <div class="panel"><h2>事件时间线(追加式历史)</h2><div id="events"></div></div>
@@ -158,28 +181,72 @@ async function loadMedia() {
       : '<option value="">(samples/ 目录下没有视频)</option>';
   } catch (e) { $('m_msg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
 }
-async function assessMedia() {
-  const name = $('m_src').value; if (!name) return;
-  $('m_report').textContent = '检测中…';
+async function submitStyle() {
+  const body = { source: $('m_src').value, prompt: $('m_prompt').value.trim(), provider: $('m_provider').value,
+                 model: $('m_model').value.trim() || null, chunks: +$('m_chunks').value, stride: +$('m_stride').value,
+                 budget_cny: +$('m_budget').value, require_approval: $('m_approval').checked,
+                 inject: $('m_inject').value || null, base_delay: 1, target_height: 360, concurrency: 4 };
+  if (!body.source) { $('m_msg').innerHTML = '<span class="err">没有可用素材</span>'; return; }
   try {
-    const r = await api('/api/media/assess?name=' + encodeURIComponent(name));
-    const i = r.info, m = r.metrics;
-    let h = `<b style="color:var(--${r.ok ? 'ok' : 'fail'})">${r.ok ? '✔ 合适' : '✘ 不合适'}</b>`;
-    if (i) h += `<div class="muted">${i.width}x${i.height} ${i.fps}fps ${i.duration_s}s ≈${i.frames_est}帧</div>`;
-    if (m) h += `<div class="muted">背景稳定 ${(m.static_bg_ratio*100).toFixed(0)}% · 前景占比 ${(m.fg_ratio_mean*100).toFixed(1)}%</div>`;
-    (r.reasons||[]).forEach(x => h += `<div class="err">✘ ${esc(x)}</div>`);
-    (r.warnings||[]).forEach(x => h += `<div class="muted">! ${esc(x)}</div>`);
-    $('m_report').innerHTML = h;
-  } catch (e) { $('m_report').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
-}
-async function submitFrames() {
-  const body = { source: $('m_src').value, chunks: +$('m_chunks').value, require_approval: $('m_approval').checked,
-                 inject: $('m_inject').value || null, base_delay: 1 };
-  if (body.inject === 'hang') body.stall_timeout_s = 8;
-  try {
-    const r = await api('/api/tasks/frames', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
-    $('m_msg').textContent = '已提交 ' + r.id; selTask = r.id; selStep = null; evs = []; evAfter = 0; refresh();
+    const r = await api('/api/tasks/style', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+    $('m_msg').textContent = '已提交 ' + r.id; selTask = r.id; selStep = null; selFrame = null; evs = []; evAfter = 0; refresh();
   } catch (e) { $('m_msg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
+}
+
+// ---- 帧网格 / 对比查看 / 用量
+let selFrame = null, _gridSig = '', _viewSig = '';
+function frameClass(f) {
+  const st = f.status === 'DONE' && f.cached ? 'cached' : f.status;
+  return `fc ${st}${f.maybe_duplicated ? ' dup' : ''}${selFrame && selFrame.item === f.item_key && selFrame.step === f.step_key ? ' sel' : ''}`;
+}
+async function renderFrames(t) {
+  const has = t.steps.some(s => s.key.startsWith('stylize_'));
+  $('framesrow').style.display = has ? '' : 'none';
+  if (!has) return;
+  let fr, us;
+  try { [fr, us] = await Promise.all([api(`/api/tasks/${t.id}/frames`), api(`/api/tasks/${t.id}/usage`)]); } catch (e) { return; }
+  const sig = fr.frames.map(f => f.step_key + f.item_key + f.status + f.calls + (selFrame ? selFrame.item : '')).join('|');
+  if (sig !== _gridSig) {
+    _gridSig = sig;
+    const legend = [['DONE','完成'],['cached','命中帧缓存'],['INFLIGHT','请求中'],['RETRY','等待重试'],['FAILED','失败'],['DEGRADED','降级(原图直通)'],['PENDING','待处理']]
+      .map(([k, n]) => `<span><i class="fc ${k}" style="display:inline-block;width:10px;height:10px;animation:none"></i>${n}</span>`).join('');
+    $('framegrid').innerHTML = `<div class="legend">${legend}<span><i style="border:1px solid #fff"></i>白框=可能被重复计费</span></div>` +
+      (fr.frames.length ? `<div style="display:flex;flex-wrap:wrap;gap:3px">` + fr.frames.map(f =>
+        `<div class="${frameClass(f)}" title="帧 ${f.idx} · ${f.status} · 调用 ${f.calls}" onclick="pickFrame('${f.step_key}','${f.item_key}')"></div>`).join('') + '</div>'
+        : '<span class="muted">工序 3 还没有开始(关键帧提取完成后才会出现)</span>') +
+      `<div class="muted" style="margin-top:6px">${Object.entries(fr.by_status).map(([k, v]) => k + ' ' + v).join(' · ')}</div>`;
+  }
+  const u = us.total || {}, bud = us.budget_cny, pct = bud ? Math.min((u.cost_cny_est || 0) / bud * 100, 100) : 0;
+  $('usage').innerHTML = us.total && Object.keys(u).length ? `
+    <div>${esc(us.provider || '')} ${esc(us.model || '')} · 单价 ${esc(us.price_cny)} 元/张</div>
+    <table style="width:auto;margin:4px 0"><tr><td class="muted">帧数</td><td>${u.frames}</td><td class="muted">接口调用</td><td>${u.calls}</td></tr>
+      <tr><td class="muted">计费张数</td><td>${u.billed}</td><td class="muted">output_tokens</td><td>${u.output_tokens}</td></tr>
+      <tr><td class="muted">帧缓存命中</td><td>${u.cached}</td><td class="muted">降级 / 失败</td><td>${u.degraded} / ${u.failed}</td></tr></table>
+    <div>费用估算 <b>${(u.cost_cny_est || 0).toFixed(2)} 元</b>${bud ? ` / 预算 ${bud} 元` : ''}
+      ${u.maybe_billed ? `<span class="err"> · 可能多付 ${u.maybe_billed} 张 ≈ ${(u.cost_maybe_extra_cny_est || 0).toFixed(2)} 元</span>` : ''}</div>
+    <div class="bar ${pct > 90 ? 'bad' : ''}"><i style="width:${pct}%"></i></div>
+    <div class="muted" style="margin-top:4px">${esc(us.note)}</div>
+    <details style="margin-top:4px"><summary>按块</summary><table><tr><th>块</th><th>帧</th><th>调用</th><th>计费</th><th>tokens</th><th>费用</th></tr>
+      ${Object.entries(us.per_step).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.frames}</td><td>${v.calls}</td><td>${v.billed}</td><td>${v.output_tokens}</td><td>${v.cost_cny_est}</td></tr>`).join('')}</table></details>`
+    : '<span class="muted">还没有用量记录</span>';
+}
+async function pickFrame(step, item) { selFrame = {step, item}; _gridSig = ''; _viewSig = ''; if (curTask) await renderFrames(curTask); renderFrameView(); }
+async function renderFrameView() {
+  if (!selFrame || !selTask) { $('frameview').innerHTML = ''; return; }
+  let items = [];
+  try { items = (await api(`/api/tasks/${selTask}/frames`)).frames; } catch (e) { return; }
+  const f = items.find(x => x.step_key === selFrame.step && x.item_key === selFrame.item); if (!f) return;
+  const sig = selTask + selFrame.item + f.status + f.calls + f.updated_at;
+  if (sig === _viewSig) return; _viewSig = sig;
+  const base = `/api/tasks/${selTask}/frames/${f.step_key}/${f.item_key}/image`;
+  $('frameview').innerHTML = `<div><b>帧 ${f.idx}</b> <span class="badge st-${f.status === 'DONE' ? 'SUCCEEDED' : f.status === 'FAILED' ? 'FAILED' : 'RUNNING'}">${esc(f.status)}</span>
+    <span class="muted">${esc(f.step_key)}</span></div>
+    <div style="display:flex;gap:8px;margin:4px 0"><div><div class="muted">源帧</div><img src="${base}?kind=src&w=360" style="max-width:100%;border:1px solid var(--line)"></div>
+      <div><div class="muted">结果</div><img src="${base}?kind=out&w=360" style="max-width:100%;border:1px solid var(--line)" onerror="this.alt='还没有结果'"></div></div>
+    <table style="width:auto"><tr><td class="muted">调用次数</td><td>${f.calls}</td><td class="muted">计费</td><td>${f.billed}</td><td class="muted">可能多付</td><td>${f.maybe_billed}</td></tr>
+      <tr><td class="muted">tokens</td><td>${f.output_tokens}</td><td class="muted">缓存/复用</td><td>${f.cached ? '帧缓存' : f.resumed ? '续跑复用' : '-'}</td><td class="muted">耗时</td><td>${f.latency_s ?? '-'}s</td></tr></table>
+    ${f.error ? `<div class="err">${esc(f.error_kind || '')}: ${esc(f.error)}</div>` : ''}
+    ${f.size_adjusted ? `<div class="muted">返回尺寸 ${f.size_adjusted.join('x')},已规整到标准尺寸</div>` : ''}`;
 }
 
 async function submitPlan() {
@@ -239,7 +306,7 @@ function renderTasks(list) {
       <div class="bar ${ok?'ok':bad?'bad':''}"><i style="width:${t.percent}%"></i></div></div>`;
   }).join('') || '<span class="muted">暂无任务</span>';
 }
-function pick(id) { selTask = id; selStep = null; evs = []; evAfter = 0; refresh(); }
+function pick(id) { selTask = id; selStep = null; selFrame = null; _gridSig = ''; _viewSig = ''; evs = []; evAfter = 0; refresh(); }
 
 function layout(steps) {
   const by = Object.fromEntries(steps.map(s => [s.key, s])), depth = {};
@@ -392,7 +459,7 @@ async function refresh() {
     renderTasks(list);
     if (selTask) {
       const t = await api('/api/tasks/' + selTask); curTask = t;
-      renderDetail(t); await renderStep(t); await renderAgent(t);
+      renderDetail(t); await renderStep(t); await renderFrames(t); renderFrameView(); await renderAgent(t);
       const more = await api(`/api/tasks/${selTask}/events?after=${evAfter}`);
       if (more.length) { evs = evs.concat(more); evAfter = more[more.length-1].seq; }
       renderEvents();

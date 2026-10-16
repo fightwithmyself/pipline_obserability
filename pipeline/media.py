@@ -51,8 +51,15 @@ def probe_video(path: str | Path) -> dict:
     fps_m = re.search(r"(\d+(?:\.\d+)?)\s*fps", out)
     duration = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else 0.0
     fps = float(fps_m.group(1)) if fps_m else 0.0
+    w, h = int(v.group(2)), int(v.group(3))
+    # 手机竖拍视频:编码尺寸是横的,靠 displaymatrix 旋转 90/270 度播放;ffmpeg 转码时会自动转正,
+    # 所以"显示尺寸"要交换宽高,否则按编码尺寸算目标分辨率会把画面拉伸变形
+    rot_m = re.search(r"rotation of (-?\d+(?:\.\d+)?) degrees", out)
+    rotation = int(round(float(rot_m.group(1)))) % 360 if rot_m else 0
+    if rotation in (90, 270):
+        w, h = h, w
     return {
-        "codec": v.group(1), "width": int(v.group(2)), "height": int(v.group(3)),
+        "codec": v.group(1), "width": w, "height": h, "rotation": rotation,
         "fps": fps, "duration_s": round(duration, 3),
         "frames_est": int(round(duration * fps)) if fps else 0,
         "has_audio": "Audio:" in out,

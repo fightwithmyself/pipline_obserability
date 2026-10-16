@@ -184,7 +184,8 @@ def classify_http_error(status: int, code: str, message: str, retry_after: float
             return FatalError(text, "quota")
         return FatalError(text, "auth")
     if status == 404:
-        return FatalError(text, "not_found")
+        # 实测:ModelNotOpen = 账号没在方舟控制台开通该模型;InvalidEndpointOrModel.NotFound = 模型不存在/已下线/无权限
+        return FatalError(text, "model_not_open" if "modelnotopen" in c else "not_found")
     if status == 402 or any(m in c for m in QUOTA_MARKERS):
         return FatalError(text, "quota")
     if any(m in c for m in MODERATION_MARKERS):

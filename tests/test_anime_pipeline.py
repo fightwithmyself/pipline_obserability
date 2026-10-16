@@ -286,3 +286,23 @@ def test_source_modified_after_submit_is_rejected(engine, data_dir, tmp_path):
     p.write_bytes(p.read_bytes() + b"tamper")
     t = run_to_end(engine, data_dir, tid, timeout=60)
     assert t["status"] == "FAILED" and "修改" in step(t, "ingest")["error_msg"]
+
+
+def test_rotated_phone_video_is_not_stretched(engine, data_dir, tmp_path):
+    """手机竖拍:编码尺寸是横的,靠旋转元数据播放。目标尺寸必须按"显示尺寸"算,否则画面被拉伸。"""
+    import subprocess
+    from pipeline.media import ffmpeg_exe, probe_video
+    src = make_clip(tmp_path / "land.mp4", w=192, h=108, fps=FPS, secs=2.0)
+    rot = tmp_path / "phone.mp4"
+    subprocess.run([ffmpeg_exe(), "-v", "error", "-y", "-display_rotation", "90", "-i", str(src),
+                    "-c", "copy", str(rot)], check=True)
+    info = probe_video(rot)
+    assert info["rotation"] in (90, 270) and (info["width"], info["height"]) == (108, 192)
+    assert probe_video(src)["rotation"] == 0
+
+    tid = submit(engine, rot, target_height=192)
+    t = run_to_end(engine, data_dir, tid, timeout=120)
+    assert t["status"] == "SUCCEEDED", [(s["key"], s["error_msg"]) for s in t["steps"] if s["error_msg"]]
+    final = engine.store.path(step(engine.get_task(tid), "package")["outputs"]["final.mp4"]["sha256"])
+    out = probe_video(final)
+    assert (out["width"], out["height"]) == (108, 192)          # 竖屏保持竖屏,不是 342x192 之类的拉伸

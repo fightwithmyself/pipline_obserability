@@ -137,6 +137,14 @@ def test_missing_key_and_model(monkeypatch):
         ArkDoubao("")
 
 
+def test_classify_real_404_codes():
+    """这两个错误码是用真实密钥实测到的(见 README 9.2)。"""
+    a = classify_http_error(404, "ModelNotOpen", "Your account has not activated the model x")
+    b = classify_http_error(404, "InvalidEndpointOrModel.NotFound", "does not exist or you do not have access")
+    assert isinstance(a, FatalError) and a.kind == "model_not_open"
+    assert isinstance(b, FatalError) and b.kind == "not_found"
+
+
 def test_classify_is_conservative():
     assert isinstance(classify_http_error(400, "SomethingNew", "?"), FatalError)     # 未知 4xx 不重试烧钱
     assert isinstance(classify_http_error(503, "", ""), Transient)

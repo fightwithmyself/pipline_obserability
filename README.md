@@ -12,7 +12,7 @@
 | 部分 | 状态 |
 |---|---|
 | 任务引擎(状态机/租约/fencing/重试/缓存/崩溃恢复) | **真实**,`kill -9` 级别的测试(见第 8 节) |
-| 6 道工序里的视频处理(ffmpeg 转码/拆帧/合成/混音、numpy 调色与补间) | **真实**,跑过真实素材(`lumberjacks_7s.mp4`) |
+| 6 道工序里的视频处理(ffmpeg 转码/拆帧/合成/混音、numpy 调色与补间) | **真实**,跑过真实素材(`cba.mp4`) |
 | **豆包模型调用** | **默认是离线 Mock**(色阶分层 + 描边 + 色偏,**不代表真实模型的画质**)。`ArkDoubao` 客户端已写好,**但从未用真实密钥调用过**:请求体、错误码映射都按文档假设写成,只对着本地假服务器测过(见 9.2) |
 | 失败恢复语义 | **在 Mock 服务器的"计费账本"上被证明**(每次调用落一个文件,测试直接数"花了几次钱"),真实服务的行为待接密钥后验证 |
 | Dashboard 逐帧网格/对比/用量 | 写好并通过 `node --check` 与接口测试,**没有在真实浏览器里点过** |
@@ -45,7 +45,7 @@ py -3.11 -m venv .venv                       # 虚拟环境,依赖不污染本�
 
 ```powershell
 $env:PIPELINE_MEDIA_DIR="samples"            # 素材目录;接口只接受目录下的纯文件名
-python -m pipeline.cli --data data submit-style --source samples\lumberjacks_7s.mp4 `
+python -m pipeline.cli --data data submit-style --source samples\cba.mp4 `
     --prompt "日系动漫风格,保持人物与动作不变" --chunks 4 --stride 6 --budget 50 --inject response_lost
 python -m pipeline.cli --data data worker --id w1 --resources cpu,gpu --lease-ttl 5 --idle-exit 5   # 可起多个
 python -m pipeline.cli --data data status          # 任务/步骤状态
@@ -63,7 +63,7 @@ python -m pipeline.cli --data data frames <task>   # 逐帧账本(--all 含正�
 ```powershell
 $env:ARK_API_KEY="你的密钥"          # 只从环境变量读取;不进任务参数、数据库、日志
 python -m pipeline.cli --data data submit-style --provider ark --model <控制台里的模型ID或Endpoint> `
-    --source samples\lumberjacks_2s.mp4 --prompt "日系动漫风格" --stride 12 --budget 5
+    --source samples\cba.mp4 --prompt "日系动漫风格" --stride 12 --budget 5
 ```
 
 提交时按"单价 × 预计关键帧数"做预算检查,**超预算在调用接口之前就失败**。单价默认 0.12 元/张,**只用于估算,以账单为准**。
@@ -193,10 +193,12 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | 坏素材 / 提交后被替换 | 永久失败,后续步骤一步都没跑 |
 | 补间不跨镜头 | `select_keyframes` 的单元测试覆盖(切点两侧强制选取、重复帧跳过、间隔强制补选) |
 
-**一次真实素材的完整运行**(`lumberjacks_7s.mp4`:720×400、24fps、178 帧;`--chunks 4 --stride 6`,注入 1 次 `response_lost`,**Mock 模型**,2 个 worker,**只跑了 1 次**):
-选出 **30 张关键帧**(占 17%);标准化到 1920×1080(宽 1944);任务总耗时约 41 s;用量 31 次调用 / 30 张计费 / 1 张"可能多付",
-按 0.12 元/张**估算**为 3.6 元(**这是估算,不是真实账单**;mock 的 `output_tokens` 也是模拟值,不能当真)。
-同一台机器第一次尝试时 ffmpeg 报 `x264 malloc failed` / `Could not open encoder`,3 次重试都失败 → 任务 `FAILED`;
+**一次真实素材的完整运行**(`cba.mp4`:568×320、约 30fps、6.47 s、194 帧、带音轨,一段篮球场边视频;提示词"日式动漫风格,赛璐璐上色,清晰的线稿,保持人物、动作与构图不变";
+`--chunks 4 --stride 6`,**Mock 模型**,2 个 worker,**只跑了 1 次**):
+选出 **27 张关键帧**(占约 14%);标准化到 1916×1080、24fps;任务总耗时约 37 s;27 次调用 / 27 张计费 / 0 张"可能多付",
+按 0.12 元/张**估算**为 3.24 元(**这是估算,不是真实账单**;mock 的 `output_tokens` 也是模拟值,不能当真)。
+**Mock 的"动漫风"只是色阶分层 + 描边,肉眼看更像海报化滤镜,不是日式动漫**;真实效果要等豆包密钥。
+(之前在另一段已删除的素材上跑时,)同一台机器第一次尝试时 ffmpeg 报 `x264 malloc failed` / `Could not open encoder`,3 次重试都失败 → 任务 `FAILED`;
 当时系统可用虚拟内存只剩约 300–700 MB(浏览器等占用),恢复后同样命令一次成功。**这是宿主机内存压力,不是流水线 bug**,但也说明:
 内存不足被归为 `TRANSIENT` 并按退避重试(合理),重试预算耗尽才报 FAILED;并没有区分"内存不足"与其他转码失败(见 9.2)。
 

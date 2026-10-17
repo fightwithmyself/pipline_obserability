@@ -7,16 +7,102 @@
 
 > 设计推导:[`docs/DESIGN.md`](docs/DESIGN.md)(执行引擎;**第 15 节是现行的逐帧流水线**,第 3.1 节的动画 DAG 是旧的引擎演示);Agent 层:[`docs/AGENT_PLAN.md`](docs/AGENT_PLAN.md)。
 
+## 效果展示
+
+### 素材与效果
+
+左 = 原始素材(`samples/cba.mp4`,6.5 秒,320×568 竖屏,带音频),右 = 流水线成品(Seedream 5.0 pro,720 高,已合入原音频,27 张关键帧生成、其余帧运动补偿补帧)。
+
+![素材 vs 成品](docs/assets/compare.gif)
+
+- 素材:[`docs/assets/source_cba.mp4`](docs/assets/source_cba.mp4)
+- 成品(完整流水线真实输出):[`docs/assets/result_seedream5pro.mp4`](docs/assets/result_seedream5pro.mp4)
+- 左右对比视频:[`docs/assets/compare_side_by_side.mp4`](docs/assets/compare_side_by_side.mp4);关键帧对比:
+
+![关键帧对比](docs/assets/compare_frames.png)
+
+> 诚实说明:这是**一段素材、一次真实运行**的结果。风格化是整帧生成,模型会改变画面细节(例如地板倒影、人物脸部在关键帧之间会变,见 9.2);
+> 素材来源与授权我没有逐一核实,仓库里放它只为演示,**公开使用前请自行确认授权**。对比图由 `scripts/make_readme_assets.py` 生成。
+
+### 整体流程图
+
+**系统结构**:决策(LangGraph + 模型)与执行(自写引擎 + worker)分层,两层各有自己的持久化。
+
+```mermaid
+flowchart LR
+    U["用户: 看板 / CLI<br/>选视频 + 填风格"] -->|"启动 / 中断 / 继续"| API["FastAPI + 看板<br/>(pid 文件判断进程是否存活)"]
+    API -->|"子进程"| AG
+    subgraph AG["Agent 进程 (LangGraph StateGraph)"]
+        A["agent 节点<br/>doubao-seed-2.1-pro<br/>load_skill + 函数调用"] -->|"tool_calls"| T["tools 节点<br/>同一轮的调用并行执行"]
+        T -->|"ToolMessage"| A
+    end
+    AG <-->|"每个超步一个 checkpoint<br/>messages / 阶段状态"| CK[("agent_checkpoints.db<br/>SqliteSaver")]
+    T -->|"幂等提交阶段子任务 + 等待"| ENG[("pipeline.db 引擎<br/>状态机 · 租约 · fencing · 步骤缓存")]
+    A -.->|"每轮 token / 工具调用"| OBS[("agent_* 观测表")]
+    ENG --> W["Worker x N<br/>(每个步骤一个子进程)"]
+    W --> S["an_ingest … an_package"]
+    S -->|"图生图(同步)"| SD[["Seedream 5.0 pro"]]
+    S --> FS[("逐帧账本 · 产物 · 帧缓存")]
+    S -.-> FF["ffmpeg / numpy"]
+```
+
+**流水线阶段**(每个节点是一个工具调用 = 一个引擎子任务;风格化与后处理按分块并行):
+
+```mermaid
+flowchart LR
+    K["读取 skill"] --> I["1 摄取 / 标准化"] --> KF["2 关键帧提取<br/>(模型决定 chunks / stride)"]
+    KF --> S0["3 风格化 #0"] & S1["3 风格化 #1"] & SN["3 风格化 #N"]
+    S0 & S1 & SN --> PS["4a 统计"]
+    PS --> P0["4b 后处理 #0"] & P1["4b 后处理 #1"] & PN["4b 后处理 #N"]
+    P0 & P1 & PN --> QC["5 质检"] --> MX["5 合成音频"] --> PK["6 打包发布"]
+```
+
+**失败、中断与恢复**:
+
+```mermaid
+flowchart TD
+    F["阶段失败"] --> RB{"处置手册匹配"}
+    RB -->|"可自动恢复且未超次数"| RT["Agent: retry_stage"] --> GO["继续执行"]
+    RB -->|"鉴权 / 配额 / 未知"| ES["Agent: escalate_to_human<br/>状态 NEEDS_HUMAN + 人工恢复步骤"]
+    B["用户点 ⏸ 中断"] --> SOFT["软中断: INTERRUPTING<br/>在检查点停下并存 checkpoint"]
+    SOFT -->|"20 秒内没停"| KILL["强杀进程树"] --> INT
+    SOFT --> INT["INTERRUPTED(中断节点橙色虚线)"]
+    INT -->|"点 ▶ 从 checkpoint 继续"| RS["已完成节点与决策轮不重做<br/>中断阶段按幂等键接上"] --> GO
+    ES -->|"人工处理后继续"| RS
+```
+
+### 看板截图
+
+**成功(真实运行)**:`doubao-seed-2.1-pro` 决策 + `doubao-seedream-5-0-pro-260628` 出图,10 轮决策、27 次图像调用、全部节点完成。
+页面里的分阶段表就是"每阶段 token":决策模型提示 49,036 + 生成 1,927(推理 711);图像模型输出 450,212 tokens;风格化 316.8 秒、后处理 53.3 秒,总计 443.6 秒。
+
+![真实运行成功](docs/assets/real_run_success.png)
+
+**失败(真实运行,配额用尽)**:换成"把人物换成企鹅"的指令再跑,4 个并行风格化块全部返回 `429 AccountQuotaExceeded`(同时夹杂 `AccountRateLimitExceeded`)。
+决策模型尝试了一次 `retry_stage`(引擎侧该子任务已是 CANCELLED),随后调用 `escalate_to_human`,运行标记为"需要人工"并写明原因与步骤;图中红色节点是失败的风格化块,后面的节点保持待执行。
+
+![真实运行失败:配额用尽,升级人工](docs/assets/real_run_quota_failed.png)
+
+**中断与恢复**(下面三张是**离线演示**:脚本决策策略 + Mock 图像,不花钱;中断/恢复机制与真实运行相同,但**不是**真实模型/真实图像的运行):
+
+| 运行中(后处理并行执行) | 点击"中断":在节点处停下,checkpoint 已保存 | 点击"从 checkpoint 继续" |
+|---|---|---|
+| ![运行中](docs/assets/demo_running.png) | ![已中断](docs/assets/demo_interrupted.png) | ![恢复中](docs/assets/demo_resuming.png) |
+
+恢复后全部完成:
+
+![恢复完成](docs/assets/demo_resumed_done.png)
+
 ## 先读这个:什么是真的、什么不是
 
 | 部分 | 状态 |
 |---|---|
 | 任务引擎(状态机/租约/fencing/重试/缓存/崩溃恢复) | **真实**,`kill -9` 级别的测试(见第 8 节) |
 | 6 道工序里的视频处理(ffmpeg 转码/拆帧/合成/混音、numpy 调色与补间) | **真实**,跑过真实素材(`cba.mp4`) |
-| **豆包模型调用** | 测试与演示默认用离线 Mock(色阶分层 + 描边,**不代表真实模型的画质**)。**真实调用已跑通一次完整任务**:Agent Plan + `doubao-seedream-5-0-flash-260915`,27 张关键帧全部成功(见 8.2)。**只跑过一段 6 秒素材、一个模型;审核/限流/欠费等失败路径的真实错误码没有触发过**(见 9.2) |
+| **豆包模型调用** | 测试默认用离线 Mock(色阶分层 + 描边,**不代表真实模型画质**)。**真实调用已跑通完整任务**:Agent Plan + `doubao-seedream-5-0-flash-260915`(27 帧),以及 `doubao-seedream-5-0-pro-260628` 经 Pipeline Agent 跑通一次(27 帧、450,212 output tokens、443.6 秒)。**真实失败也见到了一种**:配额用尽时返回 `429 AccountQuotaExceeded`(与 `AccountRateLimitExceeded` 并存),原先被当成可重试的瞬时限流,已改为致命的 quota 并加了测试。**仍只验证了一段 6 秒素材;审核/欠费两类的真实错误码没有触发过**(见 9.2) |
 | 失败恢复语义 | **在 Mock 服务器的"计费账本"上被证明**(每次调用落一个文件,测试直接数"花了几次钱"),真实服务的行为待接密钥后验证 |
-| Dashboard 逐帧网格/对比/用量 | 写好并通过 `node --check` 与接口测试,**没有在真实浏览器里点过** |
-| **Pipeline Agent(LangGraph + `doubao-seed-2.1-pro` 决策)** | 离线测试用**固定脚本策略**(不是智能体,只验证编排/并行/恢复/记账)。**真实决策模型跑通一次完整流水线**(10 轮决策、并行 4 路风格化与后处理),但那次**图像模型是 Mock**;**`doubao-seedream-5-0-pro` 在流水线里没有跑过**,真实 Agent + 真实图像 + 故障场景下的决策质量**未验证**(见 3.6、9.2) |
+| Dashboard(帧网格/用量/Pipeline Agent 流程图与中断按钮) | 通过 `node --check` 与接口测试,并用**无头 Edge 渲染截图**确认页面能显示(见效果展示);**没有人在真实浏览器里逐个点过按钮** |
+| **Pipeline Agent(LangGraph + `doubao-seed-2.1-pro` 决策)** | 离线测试用**固定脚本策略**(不是智能体,只验证编排/并行/恢复/记账)。**真实决策模型 + 真实 Seedream pro 跑通了一次完整流水线**(10 轮决策,并行 4 路风格化与后处理);另有**一次真实失败**(配额用尽):模型尝试一次重试后调用 `escalate_to_human`,标记需要人工并给出原因与步骤。**这是 1 次成功 + 1 次失败的观察,不是评测**;模型在其他失败场景下的决策质量**未验证**(见 3.6、9.2) |
 | 诊断 Agent(第 3.5 节)与旧 Planner | 诊断 Agent 已接入新流水线;Planner 仍只认旧的 MOCK 动画 DAG |
 
 ## 目录
@@ -39,7 +125,7 @@
 ```powershell
 py -3.11 -m venv .venv                       # 虚拟环境,依赖不污染本机
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest -q      # 135 个测试,约 7 分钟(含真实 kill -9、混沌测试、真实视频处理)
+.\.venv\Scripts\python.exe -m pytest -q      # 136 个测试,约 7 分钟(含真实 kill -9、混沌测试、真实视频处理)
 ```
 
 **离线演示(Mock 模型,不花钱)**:
@@ -183,7 +269,7 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 
 **必须说清的局限**:
 - 默认是 `MockLLM` 的**规则**,不是真实模型的诊断。没有用真实 LLM 评估过诊断质量,"LLM 理解错误"的部分**未验证**;安全性来自手册与护栏,不来自模型。
-- 手册靠**匹配本项目自己的错误文本**,文本改了要同步改(测试用真实文本做回归);豆包真实的 429/审核/欠费错误码没有触发过,对应分支是按猜测写的。
+- 手册靠**匹配本项目自己的错误文本**,文本改了要同步改(测试用真实文本做回归);豆包真实的审核/欠费错误码没有触发过,对应分支是按猜测写的;`429 AccountQuotaExceeded` 是真实见到的(见效果展示),原先被手册当成可重试的"部分帧失败"并给出了不贴切的人工步骤,已改为致命的 quota 分类(`classify_http_error`)。
 - 自动恢复的白名单与"最多 2 次"是我手设的;"没有人在看时能不能自动重试"是安全与便利的取舍,默认关闭。
 - 没有"自动改参数后重试"(例如降并发、换提示词):这类恢复会改变任务含义,只给人工建议。
 - 看板不会主动弹出提醒,需要看"AI 诊断"面板或事件时间线;没有邮件/IM 通知。
@@ -299,12 +385,12 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 
 > 所有数字来自本仓库的测试与脚本,可复现。**模型调用均为 Mock**;Mock 服务器的"计费账本"是恢复语义的判据。
 
-### 8.1 测试总览(135 个,全部通过,约 7 分钟,Windows)
+### 8.1 测试总览(136 个,全部通过,约 7 分钟,Windows)
 
 | 文件 | 个数 | 内容 |
 |---|---|---|
 | `test_anime_pipeline.py` | 15 | 新流水线的端到端与恢复语义(见 8.2) |
-| `test_doubao_client.py` | 12 | `ArkDoubao` 对本地假服务器:请求形态、鉴权头、b64 解码、429/401/500/审核/未知 400 的映射、连接失败=未发出、缺密钥/缺模型 |
+| `test_doubao_client.py` | 13 | `ArkDoubao` 对本地假服务器:请求形态、鉴权头、b64 解码、429(含真实见到的 `AccountQuotaExceeded` 与 `AccountRateLimitExceeded`)/401/500/审核/未知 400 的映射、连接失败=未发出、缺密钥/缺模型 |
 | `test_api_style.py` | 2 | 提交校验、帧账本/图片/用量/报告接口、路径参数拒绝穿越 |
 | `test_engine.py` / `test_failures.py` / `test_chaos.py` / `test_smoke.py` | 11 / 14 / 1 / 1 | 引擎:见 8.3 |
 | `test_pipeline_agent.py` | 18 | Pipeline Agent:并行风格化、软中断后 checkpoint 续跑不重复花钱、**真实子进程中断(API 强杀进程树)后 CLI 续跑**、流程图状态、中断/继续接口的守卫、素材上传校验、幂等阶段、跨线程缓存复用、失败重试/升级人工、手册拒绝、参数校验、`ArkChat`(MockTransport)、API |
@@ -429,11 +515,11 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 
 | 问题 | 原因 / 影响 | 如果继续做 |
 |---|---|---|
-| **真实调用只覆盖了"成功路径"和几种配置类错误** | 已验证:请求体(`b64_json` + `watermark=false`)被接受、响应与 `usage` 可解析、27 帧全成功。已见到的真实错误:`InvalidEndpointOrModel.NotFound`(模型已下线)、`ModelNotOpen`(未开通)、`InvalidParameter`(400,带了 flash 不支持的 `sequential_image_generation`,已删)。**限流 429、内容审核、欠费这三类的真实错误码一次都没触发过**,对应映射仍是**子串猜测**;未知 400 一律按致命处理(保守,但可能把可恢复的错误当致命)。也不知道失败/被拒请求是否计费 | 用小额度故意触发(超并发、违规提示词),记录真实响应 |
+| **真实调用覆盖有限** | 已验证:请求体被接受、响应与 `usage` 可解析、flash 与 pro 各跑通 27 帧。已见到的真实错误:`InvalidEndpointOrModel.NotFound`、`ModelNotOpen`、`InvalidParameter`(400,带了 flash 不支持的 `sequential_image_generation`,已删)、**`429 AccountQuotaExceeded` 与 `429 AccountRateLimitExceeded`**(见效果展示)。**内容审核、欠费(402)两类的真实错误码仍没触发过**,映射是**子串猜测**;未知 400 一律按致命处理(保守,但可能把可恢复的错误当致命)。`AccountQuotaExceeded` 是否会按时间窗口自动重置、多久重置,**我不知道**——现在按致命处理,让人去看配额;也不知道失败/被拒请求是否计费 | 小额度触发审核/欠费并记录响应;查控制台配额规则 |
 | **补帧重影(已减轻,未消除)** | 线性混合时 stride=6 的运动人物会双影,QC 闪烁指标测不出。现默认运动补偿 + 结构保真度 QC(0.778 → 0.976),但仍是平移模型,有残余扭曲;阈值手设 | 缩小 stride(费用翻倍);换 RIFE/FILM(需 GPU) |
 | **步骤版本靠人工维护** | 改算法不升 `version` 会静默命中旧缓存(见 9.1 第 11 条) | 对步骤代码做哈希纳入缓存 key |
 | **帧间一致性只看了几张图,没有量化** | 每张关键帧由模型独立生成,没有 `seed` 参数可固定;观众席/脸部在关键帧间会变 | 用参考图锚定;对相邻关键帧算结构相似度,过低则只重做该帧 |
-| **只验证了一个模型、一段素材** | `5-0-flash-260915` + 一段 6 秒竖屏视频;`pro` 与普通按量接口未调用过(普通接口因账号未开通走不通) | 换 `pro` 对比画质与单价 |
+| **只验证了一段素材** | `5-0-flash-260915` 与 `5-0-pro-260628` 各跑过一段 6 秒竖屏视频(27 帧);没有对比两者画质与单价,普通按量接口因账号未开通走不通 | 换更多素材,对比 pro/flash 画质与单价 |
 | **Plan 下的真实费用未核对** | Agent Plan 按套餐额度扣,不是按元;README 里的"元"是估算 | 对照控制台用量页 |
 | **没有实现"线条对齐"工序,补帧不是 RIFE** | 用的是自写的块匹配运动补偿,快速大幅运动会失效 | 换 RIFE/FILM(需 GPU) |
 | **限流器只在进程内** | 多个 worker 同时跑 `stylize_*` 时总速率可能超过 500 IPM | 全局令牌桶(放进数据库或用单独的限流步骤) |
@@ -442,11 +528,11 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | **内存不足与转码失败未区分** | 见 8.2:`x264 malloc failed` 被归为 `TRANSIENT`,重试 3 次后失败 | 识别资源类错误,走 `RESOURCE` 的更长退避或降低并发 |
 | 质检阈值是手工定的 | 闪烁比 3.0、`dup_thr`、`cut_thr` 都没有在真实素材集上标定;只用 1 个真实素材跑过 | 收集带标注的素材,画阈值-误判曲线 |
 | **没有 VLM 质检** | 题目里的"质量校验 Agent"只有确定性检查;不会判断"人物是否被画崩" | 用多模态模型对关键帧评分,不过的帧只重做该帧 |
-| **Pipeline Agent 的真实验证很薄** | 只有一次"真实决策模型 + Mock 图像"的成功全流程;**真实 `doubao-seedream-5-0-pro-260628` 从未在流水线里调用**;失败场景下真实模型的决策没验证;没有评测集 | 小额度跑真实 pro;用故障注入对真实模型做一组评测(是否正确重试/升级) |
+| **Pipeline Agent 的真实验证很薄** | 真实决策模型 + 真实 pro 出图:**1 次成功 + 1 次失败(配额用尽)**,都是同一段素材;其余失败场景(审核、欠费、worker 崩溃等)下真实模型的决策没验证;没有评测集;配额失败那次,模型对已 CANCELLED 的子任务调用了无意义的 `retry_stage`,最后才升级人工 | 用故障注入对真实模型做一组评测(是否正确重试/升级);给 `retry_stage` 的结果加上对 CANCELLED 的明确提示 |
 | **分阶段 LLM token 是近似归属** | 一轮跨多阶段时平均分摊;推理 token 是否单独计费未核实 | 一阶段一个子 Agent,或每轮只允许一个阶段 |
 | **两套状态不是同一事务** | LangGraph checkpoint 与引擎库分开提交,靠幂等键与按引擎状态重新判断保持一致 | 把 Agent 状态也放进引擎库,或改用 Temporal |
 | **旧 Planner 没有覆盖新流水线** | `STAGE_CATALOG` 仍是旧 MOCK 阶段;Pipeline Agent 取代了它的"拆解/调度"作用,但旧 Planner 代码未删 | 删除旧 Planner 或迁移评测用例 |
-| **Dashboard 没在真实浏览器验证** | 只做了语法检查与接口测试 | Playwright 截图测试 |
+| **Dashboard 没有人工在真实浏览器里逐项验证** | 语法检查、接口测试与无头 Edge 截图;按钮交互靠接口测试覆盖 | Playwright 端到端测试 |
 | API 与 Dashboard **无鉴权**,任何人可调用 `approve` | MVP 范围外 | 身份与角色 |
 | 只在 **Windows** 验证 | Linux/macOS 路径(父进程存活监听、`ffmpeg`)未实测 | CI |
 | 没有 single-flight | 两个相同任务同时提交会各算一次(包括各花一次钱;帧缓存只在写入后才可命中) | 对帧缓存 key 加"进行中"登记 |
@@ -471,4 +557,4 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | 结合 AI pipeline 分析哪些步骤适合独立成可恢复任务 | ✅ 第 3、4 节:模型调用步骤内部再做"帧"这一层可恢复粒度 |
 | GPU/外部资源调度与可观测 | ⚠️ 仅"外部并发车道 + 进程内限流 + 用量/预算观测";无装箱/抢占/全局限流 |
 | Agent 层 | ⚠️ **Pipeline Agent**(LangGraph + `doubao-seed-2.1-pro` + 函数调用 + checkpoint 续跑 + 分阶段 token)已接入新流水线并用真实决策模型跑通一次(图像为 Mock);诊断 Agent 已接入;旧 Planner 仍只认旧 DAG;真实图像模型 + 故障场景下的决策**未验证** |
-| 对接真实第三方 API(豆包) | ✅ **跑通一次完整真实任务**(27 张关键帧,Agent Plan + Seedream 5.0 flash);⚠️ 失败路径的真实错误码(429/审核/欠费)未触发过 |
+| 对接真实第三方 API(豆包) | ✅ **跑通一次完整真实任务**(27 张关键帧,Agent Plan + Seedream 5.0 flash);⚠️ 真实 429(配额用尽/限流)已见到并处理;审核/欠费的真实错误码未触发过 |

@@ -657,6 +657,7 @@ async function refresh() {
 // 深链接:  http://127.0.0.1:8000/#t=<任务id>&s=<步骤key>  (点击任务/节点时自动更新,可收藏/分享)
 (function () {
   const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('r')) selRun = h.get('r');          // #r=<Agent 运行 thread>:直接打开某次 Agent 运行
   if (h.get('t')) selTask = h.get('t');
   if (h.get('s')) selStep = h.get('s');
 })();

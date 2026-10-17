@@ -177,6 +177,10 @@ def classify_http_error(status: int, code: str, message: str, retry_after: float
     """
     c = (code or "").lower()
     text = f"{status} {code} {message}"[:300]
+    if status == 429 and any(m in c for m in QUOTA_MARKERS):
+        # 实测(Agent Plan + seedream pro):配额用尽也是 HTTP 429,code=AccountQuotaExceeded。它和"瞬时限流"
+        # (AccountRateLimitExceeded)不同:等几秒重试没有用,按致命的 quota 处理,让人去看配额/重置时间。
+        return FatalError(text, "quota")
     if status == 429:
         return RateLimited(text, retry_after=retry_after or 2.0)
     if status in (401, 403):

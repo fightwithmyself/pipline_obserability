@@ -152,6 +152,14 @@ def test_classify_real_404_codes():
     assert isinstance(b, FatalError) and b.kind == "not_found"
 
 
+def test_classify_real_429_quota_vs_rate_limit():
+    """真实运行里同时见到的两个 429:配额用尽(重试无用,致命)与瞬时限流(可退避重试)。"""
+    q = classify_http_error(429, "AccountQuotaExceeded", "You have exceeded the quota")
+    r = classify_http_error(429, "AccountRateLimitExceeded", "Requests are too frequent")
+    assert isinstance(q, FatalError) and q.kind == "quota"
+    assert isinstance(r, RateLimited)
+
+
 def test_classify_is_conservative():
     assert isinstance(classify_http_error(400, "SomethingNew", "?"), FatalError)     # 未知 4xx 不重试烧钱
     assert isinstance(classify_http_error(503, "", ""), Transient)

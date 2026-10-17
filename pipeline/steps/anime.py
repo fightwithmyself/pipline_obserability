@@ -1118,3 +1118,23 @@ def an_package(ctx: StepContext) -> None:
     }
     ctx.output("metadata.json", canonical_json(meta).encode())
     ctx.progress(1.0, "packaged")
+
+
+@register("an_import")
+def an_import(ctx: StepContext) -> None:
+    """把前面阶段已经产出的产物"原样搬进"当前任务,作为同名依赖的替身。
+
+    Agent 按阶段(而不是整张 DAG)提交任务:上游阶段的产物通过它引入,下游步骤的代码一行不用改,
+    步骤缓存 key 里用的是产物 sha256,所以与整张 DAG 一次跑完时的缓存互通。
+    """
+    from ..artifacts import ArtifactStore
+    store = ArtifactStore(ctx.data_dir / "artifacts")
+    refs = ctx.params.get("refs") or {}
+    if not refs:
+        raise StepError(ErrorKind.PERMANENT, "an_import 没有要引入的产物")
+    for i, (name, ref) in enumerate(sorted(refs.items())):
+        sha = ref["sha256"]
+        if not store.verify(sha):
+            raise StepError(ErrorKind.PERMANENT, f"上游产物 {name} ({sha[:12]}…) 缺失或已损坏,需要重新跑产生它的阶段")
+        shutil.copyfile(store.path(sha), ctx.output_path(name))
+        ctx.progress((i + 1) / len(refs), f"import {name}")

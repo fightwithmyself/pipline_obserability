@@ -463,6 +463,52 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
     def diagnosis_decision(thread_id: str, body: DecisionRequest, agent: DiagnosisAgent = Depends(get_diag)):
         return agent.resume(thread_id, body.approve, body.comment, body.who)
 
+    # ------------------------------------------------------------ Pipeline Agent(LangGraph)
+    @app.get("/api/agent/runs")
+    def agent_runs(eng: Engine = Depends(get_engine)):
+        rows = eng.conn.execute("SELECT thread_id,status,agent_model,request,error,created_at,updated_at "
+                                "FROM agent_runs ORDER BY created_at DESC LIMIT 100").fetchall()
+        return [{k: r[k] for k in r.keys()} for r in rows]
+
+    @app.get("/api/agent/runs/{thread_id}")
+    def agent_run(thread_id: str):
+        """分阶段 token 报告 + LangGraph 当前状态(下一节点、checkpoint 数、消息)。"""
+        from .agent.orchestrator import PipelineAgent, run_report
+        from .agent.agent_llm import ScriptedAgentLLM
+        try:
+            rep = run_report(data_dir, thread_id)
+        except KeyError:
+            raise NotFound(f"agent run {thread_id}")
+        ag = PipelineAgent(data_dir, ScriptedAgentLLM())      # 只读:不会调用模型
+        try:
+            snap = ag.snapshot(thread_id)
+        finally:
+            ag.close()
+        stages = []
+        e = Engine(data_dir)
+        try:
+            for r in e.conn.execute("SELECT * FROM agent_stage_runs WHERE thread_id=? ORDER BY started_at", (thread_id,)):
+                stages.append({"stage_id": r["stage_id"], "task_id": r["task_id"], "status": r["status"],
+                               "retries": r["retries"], "summary": json.loads(r["summary"] or "null"),
+                               "error": r["error"]})
+        finally:
+            e.close()
+        return {**rep, "snapshot": snap, "stage_runs": stages}
+
+    @app.post("/api/agent/runs/{thread_id}/resume", status_code=202)
+    def agent_resume(thread_id: str, agent_llm: Literal["ark", "scripted"] = "ark"):
+        """另起子进程从最近的 checkpoint 继续(进程内不跑,避免阻塞 API)。密钥只来自服务进程的环境变量。"""
+        import subprocess
+        import sys
+        from .agent.orchestrator import run_report
+        try:
+            run_report(data_dir, thread_id)
+        except KeyError:
+            raise NotFound(f"agent run {thread_id}")
+        subprocess.Popen([sys.executable, "-m", "pipeline.cli", "--data", str(data_dir), "agent-resume", thread_id,
+                          "--agent-llm", agent_llm], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"thread_id": thread_id, "accepted": True}
+
     # ------------------------------------------------------------ Dashboard
     @app.get("/", include_in_schema=False)
     def index():

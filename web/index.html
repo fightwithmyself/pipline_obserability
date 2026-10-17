@@ -130,6 +130,11 @@
     <div class="panel"><h2>任务列表</h2><div id="tasks"></div></div>
   </aside>
   <section>
+    <details class="panel" id="agentpanel" style="margin-bottom:12px" open>
+      <summary style="cursor:pointer;color:var(--dim);font-weight:600">Pipeline Agent(LangGraph 决策模型 + 函数调用 + checkpoint)</summary>
+      <div id="agentruns" class="muted" style="margin:6px 0">暂无运行。命令行: <code>python -m pipeline.cli agent-run --source samples/xxx.mp4 --prompt "日系动漫风格" --workers 3</code></div>
+      <div id="agentdetail"></div>
+    </details>
     <div class="panel" id="detail"><span class="muted">← 选择一个任务</span></div>
     <div class="grid2" id="framesrow" style="margin-top:12px;display:none">
       <div class="panel"><h2>帧网格(工序 3:每格一个关键帧,点击查看源图与结果)</h2><div id="framegrid"></div><div id="frameview" style="margin-top:8px"></div></div>
@@ -459,7 +464,61 @@ async function renderAgent(t) {
       <td>${esc(c.status)}${c.error?' '+esc(c.error.slice(0,60)):''}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">无调用</td></tr>'}</table>`;
 }
 
+// ---- Pipeline Agent 面板:分阶段 token、工具调用时间线、LangGraph 状态
+let selRun = null, _runSig = '';
+const AST = {RUNNING:'RUNNING', SUCCEEDED:'SUCCEEDED', NEEDS_HUMAN:'FAILED', INTERRUPTED:'RETRY_WAIT', INCOMPLETE:'AWAITING_APPROVAL'};
+const GNAME = {plan:'读取 skill', ingest:'1 摄取', keyframes:'2 关键帧', stylize:'3 风格化(并行)', poststats:'4a 统计', post:'4b 后处理(并行)',
+               qc:'5 质检', mux:'5 合成音频', package:'6 打包发布', control:'控制/排障', final:'最终汇报'};
+async function pickRun(id) { selRun = id; _runSig = ''; refresh(); }
+async function resumeRun(id, llm) {
+  try { await api(`/api/agent/runs/${id}/resume?agent_llm=${llm}`, {method:'POST'}); } catch (e) { alert(e.message); }
+  refresh();
+}
+async function renderAgentRuns() {
+  let runs = []; try { runs = await api('/api/agent/runs'); } catch (e) { return; }
+  if (!runs.length) return;
+  if (!selRun) selRun = runs[0].thread_id;
+  const list = runs.map(r => `<span class="task ${r.thread_id===selRun?'sel':''}" style="display:inline-block;margin:0 6px 4px 0;padding:3px 8px" onclick="pickRun('${esc(r.thread_id)}')">
+      ${esc(r.thread_id)} <span class="badge st-${AST[r.status]||'PENDING'}">${esc(r.status)}</span></span>`).join('');
+  let d; try { d = await api('/api/agent/runs/' + encodeURIComponent(selRun)); } catch (e) { return; }
+  const sig = JSON.stringify([runs.map(r => r.thread_id + r.status + r.updated_at), d.totals, d.snapshot.checkpoints, d.stage_runs.map(s => s.status), d.tool_calls.length]);
+  if (sig === _runSig) return; _runSig = sig;
+  const t = d.totals, est = t.llm_estimated;
+  const stageRows = d.stages.map(s => `<tr><td>${esc(GNAME[s.group]||s.group)}</td><td>${s.turns}</td><td>${s.llm_prompt}</td><td>${s.llm_completion}</td>
+      <td>${s.llm_reasoning}</td><td>${s.tool_calls}${s.tool_errors?` <span class="err">(${s.tool_errors} 错)</span>`:''}</td>
+      <td>${s.stages.map(x => `<span class="badge st-${x.status==='SUCCEEDED'?'SUCCEEDED':x.status==='FAILED'?'FAILED':'RUNNING'}" title="${esc(x.task_id)}" style="cursor:pointer" onclick="pick('${esc(x.task_id)}')">${esc(x.stage_id)}${x.retries?' ↻'+x.retries:''}</span>`).join(' ')}</td>
+      <td>${s.seedream.output_tokens}${s.seedream.reused_output_tokens?` <span class="muted">(复用 ${s.seedream.reused_output_tokens})</span>`:''}</td>
+      <td>${s.seedream.cost_cny_est || 0}</td><td>${s.wall_s ?? '-'}</td></tr>`).join('');
+  const calls = d.turns.map(tn => `<tr><td>${tn.turn}</td><td>${tn.prompt ?? '-'}/${tn.completion ?? '-'}${tn.reasoning?`/思考${tn.reasoning}`:''}${tn.estimated?'~':''}</td>
+      <td>${fmtD(tn.latency_s)}</td><td style="word-break:break-all">${tn.tool_calls.map(c => `<code>${esc(c)}</code>`).join(' ') || '<span class="muted">' + esc(tn.content.slice(0,120)) + '</span>'}</td></tr>`).join('');
+  const sn = d.snapshot, run = d.run;
+  const human = sn.escalated ? `<div class="err" style="margin:6px 0"><b>⚠ Agent 已标记需要人工</b>:${esc(JSON.stringify(sn.escalated.reason || sn.escalated)).slice(0,300)}
+      <ol style="margin:2px 0 0 18px;padding:0">${((sn.escalated.human_steps)||[]).map(s => `<li>${esc(s)}</li>`).join('')}</ol></div>` : '';
+  $('agentruns').innerHTML = list;
+  $('agentdetail').innerHTML = `
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:4px 0">
+      <span class="chip">决策模型 <b>${esc(run.agent_model)}</b></span>
+      <span class="chip">图像模型 <b>${esc(run.config.model || run.config.provider)}</b></span>
+      <span class="chip">LangGraph 下一节点 <b>${esc(sn.next.join(',') || '(结束)')}</b></span>
+      <span class="chip">checkpoint <b>${sn.checkpoints}</b> 个(step ${sn.step ?? '-'})</span>
+      <span class="chip">消息 <b>${sn.messages.length}</b> 条</span>
+      <span class="chip">总耗时 <b>${t.wall_s}s</b></span>
+      <button onclick="resumeRun('${esc(selRun)}','ark')" ${['INTERRUPTED','INCOMPLETE','RUNNING'].includes(run.status)?'':'disabled'} title="从最近的 checkpoint 继续(已完成的决策轮与阶段不会重做、不会重复计费)">从 checkpoint 继续</button>
+      ${run.error ? `<span class="err">${esc(run.error.slice(0,120))}</span>` : ''}
+    </div>${human}
+    <div class="muted" style="margin:4px 0">决策模型 token${est?'(<b>估算</b>:离线脚本策略)':''}: 提示 ${t.llm_prompt} + 生成 ${t.llm_completion}(推理 ${t.llm_reasoning}),命中缓存 ${t.llm_cached} ·
+      图像模型: 调用 ${t.seedream_calls} 次,输出 ${t.seedream_output_tokens} tokens(复用 ${t.seedream_reused_tokens}),费用估算 ${t.seedream_cost_cny_est} 元</div>
+    <table><tr><th>阶段</th><th>决策轮</th><th>LLM 提示</th><th>LLM 生成</th><th>其中推理</th><th>工具调用</th><th>引擎任务(点击查看 DAG)</th><th>图像 tokens</th><th>费用(元)</th><th>耗时 s</th></tr>${stageRows}</table>
+    <div class="muted" style="font-size:11px">LLM token 按“该轮决策发出的工具调用属于哪个阶段”归属,一轮涉及多个阶段时平均分摊,是近似值;图像 tokens 来自每个风格化块的 usage.json。</div>
+    <details style="margin-top:6px"><summary>决策轮与函数调用时间线(${d.turns.length} 轮)</summary>
+      <table><tr><th>轮</th><th>tokens 提示/生成</th><th>耗时</th><th>函数调用(同一轮内并行执行)</th></tr>${calls}</table></details>
+    <details style="margin-top:6px"><summary>LangGraph state.messages(精简,最近 ${Math.min(sn.messages.length, 30)} 条)</summary>
+      <div style="max-height:300px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace">${sn.messages.slice(-30).map(m =>
+        `<div style="border-bottom:1px dashed #222b36;white-space:pre-wrap;word-break:break-all"><b>${esc(m.role)}${m.name?':'+esc(m.name):''}</b> ${esc(m.content.slice(0,300))}${m.tool_calls?' → '+esc(JSON.stringify(m.tool_calls).slice(0,300)):''}</div>`).join('')}</div></details>`;
+}
+
 async function refresh() {
+  renderAgentRuns();
   try {
     const [list, m, ws] = await Promise.all([api('/api/tasks'), api('/api/metrics'), api('/api/workers')]);
     renderHeader(m, ws);

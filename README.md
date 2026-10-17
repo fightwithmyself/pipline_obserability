@@ -16,7 +16,8 @@
 | **豆包模型调用** | 测试与演示默认用离线 Mock(色阶分层 + 描边,**不代表真实模型的画质**)。**真实调用已跑通一次完整任务**:Agent Plan + `doubao-seedream-5-0-flash-260915`,27 张关键帧全部成功(见 8.2)。**只跑过一段 6 秒素材、一个模型;审核/限流/欠费等失败路径的真实错误码没有触发过**(见 9.2) |
 | 失败恢复语义 | **在 Mock 服务器的"计费账本"上被证明**(每次调用落一个文件,测试直接数"花了几次钱"),真实服务的行为待接密钥后验证 |
 | Dashboard 逐帧网格/对比/用量 | 写好并通过 `node --check` 与接口测试,**没有在真实浏览器里点过** |
-| Planner/诊断 Agent | 仍只认旧的 MOCK 动画 DAG,**没有接入新流水线** |
+| **Pipeline Agent(LangGraph + `doubao-seed-2.1-pro` 决策)** | 离线测试用**固定脚本策略**(不是智能体,只验证编排/并行/恢复/记账)。**真实决策模型跑通一次完整流水线**(10 轮决策、并行 4 路风格化与后处理),但那次**图像模型是 Mock**;**`doubao-seedream-5-0-pro` 在流水线里没有跑过**,真实 Agent + 真实图像 + 故障场景下的决策质量**未验证**(见 3.6、9.2) |
+| 诊断 Agent(第 3.5 节)与旧 Planner | 诊断 Agent 已接入新流水线;Planner 仍只认旧的 MOCK 动画 DAG |
 
 ## 目录
 
@@ -38,7 +39,7 @@
 ```powershell
 py -3.11 -m venv .venv                       # 虚拟环境,依赖不污染本机
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest -q      # 117 个测试,约 3.5 分钟(含真实 kill -9、混沌测试、真实视频处理)
+.\.venv\Scripts\python.exe -m pytest -q      # 129 个测试,约 5 分钟(含真实 kill -9、混沌测试、真实视频处理)
 ```
 
 **离线演示(Mock 模型,不花钱)**:
@@ -93,15 +94,17 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 | 接口/看板 | FastAPI + 单文件 HTML | 核心不依赖它 |
 | 模型 | 豆包 Seedream 图生图(方舟 `POST /api/v3/images/generations`,同步,`b64_json`) | 同步接口没有"任务 id 可续查",所以恢复要靠**自己的逐帧账本**而不是服务端任务 |
 | 视频 | ffmpeg(优先系统的,否则 `imageio-ffmpeg` 自带)+ numpy + Pillow | 不引入 OpenCV |
-| 流水线编排 | **自写引擎(不是 LangGraph)** | 见下方"为什么不用现成框架" |
+| 流水线执行 | **自写引擎**(租约/fencing/缓存/崩溃恢复)| 见下方"为什么不用现成框架" |
+| **流水线决策层(Pipeline Agent)** | **LangGraph** `StateGraph(agent ⇄ tools)` + `doubao-seed-2.1-pro`(函数调用)+ `SqliteSaver` checkpoint | 模型读 skill → 以工具调用驱动 6 个阶段,同一轮发出的多个工具调用并行执行;每个工具 = 向引擎提交一个"阶段子任务";见第 3.6 节 |
 | 失败诊断 Agent | **LangGraph**(`StateGraph` + `interrupt` + `SqliteSaver` checkpoint)+ 自写处置手册 | 只有这一处用 LangGraph:它要"暂停等人确认、进程重启后继续",正好是它的强项;见第 3.5 节 |
 | Planner Agent / MCP | OpenAI 兼容客户端 + MCP | 见 `docs/AGENT_PLAN.md`;Planner **只认旧 Mock DAG,没有接入新流水线** |
 | 观测与 token 统计 | **自建**(SQLite 表 + 看板),未用 LangSmith/Langfuse/OpenTelemetry | 见下方"为什么不用现成框架" |
 
 **为什么不用现成框架(诚实版)**:
-- **编排不用 LangGraph**:LangGraph 是单进程内的图执行与状态保存,不提供本题要考察的东西——租约/心跳、fencing token、崩溃后"可能已计费"的歧义处理、子进程 kill、步骤缓存、跨 worker 调度。
-  这些要靠数据库里的状态机做,我选择自己写并用 117 个测试(含真实 `kill -9`)证明它;代价是**我自己维护了一个调度引擎**,生产环境更应该用 Temporal 等成熟系统。
-  所以这条流水线的"checkpoint/断点恢复"是**引擎自己的**:步骤级 `checkpoint`、逐帧账本、租约回收,**不是 LangGraph checkpoint**。LangGraph 的 checkpoint 只保存 Diagnosis Agent 自己的推理进度。
+- **"执行"不用 LangGraph,"决策"用**:LangGraph 是单进程内的图执行与状态保存,不提供本题要考察的东西——租约/心跳、fencing token、崩溃后"可能已计费"的歧义处理、子进程 kill、步骤缓存、跨 worker 调度。
+  这些要靠数据库里的状态机做,我选择自己写并用 100+ 个测试(含真实 `kill -9`)证明它;代价是**我自己维护了一个调度引擎**,生产环境更应该用 Temporal 等成熟系统。
+  所以**步骤内部**的断点恢复是引擎自己的(步骤级 `checkpoint`、逐帧账本、租约回收)。**决策层**(第 3.6 节)用 LangGraph:模型的对话/工具调用进度存在 LangGraph checkpoint,
+  两层各管各的状态,互不替代。
 - **观测与 token 统计不用现成框架**:这里要统计的是**图像生成接口返回的 `usage`**,并和逐帧账本(调用次数、`maybe_billed`、缓存复用)对账——LangSmith/Langfuse 面向 LLM 对话的 trace,没有"帧"这个维度,也不认 Seedream 的 `output_tokens`;
   OpenTelemetry/Prometheus/Grafana 能做指标与链路,但需要额外起服务、对账逻辑仍要自己写,与题目"MVP、可解释"的取向不符。
   代价:**看板是单文件 HTML、轮询而非推送、没有鉴权、没有历史趋势与告警**;LLM 调用(Agent 用的)的追踪表 `llm_calls` 也是"最小自建版"。
@@ -121,6 +124,10 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 | `pipeline/templates.py` | `frame_style_task`(流水线 DAG)、故障注入预设;`animation_swap_task` 是旧 MOCK DAG,**保留为引擎测试夹具** |
 | `pipeline/api.py` + `web/index.html` | REST 与看板 |
 | `pipeline/agent/diagnosis.py` + `runbook.py` | 失败诊断 Agent + 处置手册:已接入新流水线(见 3.5) |
+| `pipeline/agent/orchestrator.py` | **Pipeline Agent**:LangGraph 状态图(`agent`/`tools` 节点)、checkpoint、`run_report`(分阶段 token) |
+| `pipeline/agent/pipeline_tools.py` + `stages.py` | 13 个工具(参数用 pydantic 校验)与"阶段 → 引擎子任务"的切分/幂等提交/等待/汇总 |
+| `pipeline/agent/agent_llm.py` | `ArkChat`(`doubao-seed-2.1-pro`,函数调用,密钥只读环境变量)与离线的 `ScriptedAgentLLM` |
+| `skills/anime-style-pipeline/SKILL.md` | 流水线的阶段定义、参数决策规则、失败处置——Agent 启动时用 `load_skill` 读取 |
 | `pipeline/agent/planner.py` + `mcp_server.py` | Planner / MCP,只认旧 Mock DAG |
 
 ## 3. 长任务执行、状态管理与失败恢复的设计考量
@@ -181,6 +188,53 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 - 没有"自动改参数后重试"(例如降并发、换提示词):这类恢复会改变任务含义,只给人工建议。
 - 看板不会主动弹出提醒,需要看"AI 诊断"面板或事件时间线;没有邮件/IM 通知。
 
+### 3.6 Pipeline Agent:LangGraph + 决策模型 + 函数调用 + checkpoint
+
+```
+            ┌──────────────── LangGraph StateGraph ────────────────┐
+ start ──▶  │  agent(doubao-seed-2.1-pro)  ──有 tool_calls──▶  tools │ ──▶ 回到 agent
+            │          │ 无 tool_calls / 已升级人工 / 超轮数          │      (同一轮的多个调用并行)
+            └──────────▼─────────────────────────────────────────────┘
+                      END      state = {messages, cfg, stages, turns, escalated}  ← 每个超步写一个 checkpoint
+```
+
+- **模型读 skill**:第一轮必须调用 `load_skill("anime-style-pipeline")`,拿到 `skills/anime-style-pipeline/SKILL.md`(阶段、参数决策规则、失败处置);之后每一步只能通过工具调用推进。
+- **每个步骤 = 一个工具**:`ingest_video`、`extract_keyframes(chunks,stride,max_gap)`、`stylize_chunk(chunk)`、`poststats`、`postprocess_chunk(chunk)`、`quality_check`、`mux_audio`、`package_and_publish`,外加 `get_run_status`、`inspect_frames`、`retry_stage`、`escalate_to_human`。参数用 pydantic 校验(范围、`max_gap>=stride`、路径穿越),非法参数返回 `ERROR` 让模型改,**不执行**。
+- **风格化/人物替换并行**:模型在同一轮里发出 N 个 `stylize_chunk`,`tools` 节点用线程池同时执行,各自成为引擎里的一个子任务,由多个 worker 并行拉取;调用 `doubao-seedream-*` 的是引擎里的 `an_stylize` 步骤(图像模型 ID 来自运行配置,不是模型临时决定的,避免它改用更贵的模型)。
+- **模型的权限**:能调 13 个工具;**不能**批准/取消任务、不能改预算、不能换图像模型。`retry_stage` 受处置手册限制(鉴权/欠费等不可重试类直接拒绝并返回人工步骤,同一阶段自动重试有次数上限);无法恢复时调用 `escalate_to_human`,图结束并把 `NEEDS_HUMAN` 与人工步骤记入运行记录。
+- **两层状态各管各的**:
+  - LangGraph checkpoint(`data/agent_checkpoints.db`,`SqliteSaver`):`messages`(模型与工具之间传递的全部消息)、各阶段状态、轮数;
+  - 引擎数据库(`data/pipeline.db` + 产物目录)才是任务真相:每个阶段是一个**幂等提交**的子任务(幂等键 `agent:{thread}:{stage}:{参数哈希}`),上游产物通过 `an_import` 以内容哈希引用。
+- **中断后继续**:`python -m pipeline.cli agent-resume <thread>`(或看板"从 checkpoint 继续")= 从最近 checkpoint 接着跑。已完成的决策轮**不会重新调用模型**(不重复花 token);被打断的工具调用会重新执行,但因为幂等键与步骤缓存/逐帧账本,**不会重复提交子任务、不会重复调用图像模型**(测试里在第 5 轮用 `KeyboardInterrupt` 模拟中断再续跑,图像模型计费账本不增加;**不是真实 `kill -9` 杀整个进程**,SQLite 事务保证 checkpoint 不会写一半,但这一层我没做进程级杀死测试)。
+- **可观测**:
+  - 表 `agent_runs / agent_turns / agent_tool_calls / agent_stage_runs` 记录每一轮决策的 token(接口返回的 `usage`,含推理 token、缓存命中)、工具调用、阶段状态;
+  - `GET /api/agent/runs[/{thread}]` 与看板顶部"Pipeline Agent"面板:分阶段表(决策 token、工具调用、引擎子任务、**图像模型 token**、费用估算、耗时)、决策轮与函数调用时间线、LangGraph 的下一节点/checkpoint 数/消息、"从 checkpoint 继续"按钮;
+  - 命令行:`agent-status [thread]`。
+
+```powershell
+$env:ARK_API_KEY = "<专属密钥,只放环境变量>"
+.\.venv\Scripts\python.exe -m pipeline.cli agent-run --source samples\cba.mp4 --prompt "日系动漫风格,保持人物与动作不变" `
+    --provider ark_plan --model doubao-seedream-5-0-pro-260628 --agent-model doubao-seed-2.1-pro --budget 20 --workers 4
+# 无密钥/CI:--agent-llm scripted --provider mock(固定脚本策略,不花钱)
+```
+
+**真实运行记录**(`doubao-seed-2.1-pro` 作决策模型,**图像模型是 Mock**,素材 `cba.mp4`,线程 `real-llm-1`;数字取自 `agent_turns` 表):
+10 轮决策,提示 48,325 + 生成 1,768 token(其中推理 676,命中缓存 39,160)。模型先 `load_skill`,依次摄取 → 关键帧(自选 `chunks=4,stride=6,max_gap=24`)→ **一轮并行发出 4 个 `stylize_chunk`** → 统计 → **一轮并行 4 个 `postprocess_chunk`** → 质检 → 合成 → 发布,最后给出文字汇报。
+这只能说明"模型能按 skill 与工具协议把全流程走通";**图像费用与 token(27 次调用、7,668 output tokens)是 Mock 产生的,不是真实 Seedream 数字**。
+
+**分阶段 token 的口径与局限**:
+- 决策模型的 token 按"该轮发出的工具调用属于哪个阶段"归属,一轮跨多个阶段时**平均分摊**——是近似,不是精确归因;没有工具调用的最后一轮归入 `final`;
+- 图像模型 token 来自每个风格化块的 `usage.json`;整块命中步骤缓存时本次记为 0、原值计入"复用";
+- `ScriptedAgentLLM` 的 token 是**按字符数估算**并标 `~`/`estimated`,不要当真实用量;
+- Seedream 的 token 是否等同于计费口径、Agent Plan 下如何折算套餐额度,**我没有核实**。
+
+**必须说清的局限**:
+- 决策质量**只用一个素材、一次成功路径**验证过;失败场景下真实模型是否会正确选择 `retry_stage`/`escalate_to_human` 没有用真实模型测过(测试里是脚本策略),模型也可能反复调用无效参数或不按 skill 走——有 `max_turns`(默认 40)与参数校验兜底,但**兜底不等于决策正确**;
+- 模型能看到的是工具返回的摘要(已压缩到有限长度),看不到画面,**不做画质判断**(没有 VLM 质检);
+- 阶段内部仍是引擎的 6 道工序,Agent 没有减少工程复杂度,只是把"参数决策、阶段顺序、失败后的选择"交给了模型;
+- 工具节点用线程池并行,上限 `--max-parallel`(默认 8);同一运行里同一阶段重复调用会命中同一幂等子任务,不会重复执行;
+- 这一层是**第二套状态**(checkpoint 库 + 4 张表),与引擎数据库之间不是同一个事务,崩溃后的一致性靠"引擎侧幂等 + 恢复时按引擎状态重新判断"保证,而不是靠分布式事务。
+
 ## 4. 任务步骤与依赖关系
 
 ```
@@ -214,7 +268,9 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | `data/work/<step>/ledger/*.json`、`styled/*.png`(**恢复的事实来源**) | 逐帧账本与结果图,跨尝试保留 | 崩溃后判定"哪些帧已完成、哪些帧歧义" |
 | `data/framecache/` | 跨任务的帧结果缓存 | 同帧同参数不重复花钱 |
 | `data/mock_doubao_billing/`(仅 Mock) | 每次模型调用一个文件 | 测试里"数花了几次钱"的依据 |
-| `plans / llm_calls / diagnoses`、LangGraph checkpoint | 旧 Agent 层 | 见 `docs/AGENT_PLAN.md` |
+| `data/agent_checkpoints.db`(LangGraph `SqliteSaver`) | Pipeline Agent 的 `messages`、阶段状态、轮数,每个超步一个 checkpoint | 中断后从最近 checkpoint 续跑,已完成的决策轮不重调模型 |
+| SQLite `agent_runs / agent_turns / agent_tool_calls / agent_stage_runs` | 运行状态、每轮决策 token、工具调用与结果、阶段 ↔ 引擎子任务映射 | 可观测与分阶段 token 报告;**不是恢复依据**(恢复看 checkpoint + 引擎) |
+| `plans / llm_calls / diagnoses`、Diagnosis Agent 的 LangGraph checkpoint | 旧 Agent 层 / 诊断 Agent | 见 `docs/AGENT_PLAN.md` 与 3.5 |
 
 **刻意不持久化**:内存调度队列(由数据库谓词派生)、步骤内未存档的局部状态(丢了就从账本/检查点/开头重算)、每一次进度更新(随心跳节流)、日志全文。
 **密钥永远不落盘**:只在 `ARK_API_KEY` 环境变量里。
@@ -233,7 +289,7 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 
 > 所有数字来自本仓库的测试与脚本,可复现。**模型调用均为 Mock**;Mock 服务器的"计费账本"是恢复语义的判据。
 
-### 8.1 测试总览(117 个,全部通过,约 4.5 分钟,Windows)
+### 8.1 测试总览(129 个,全部通过,约 5 分钟,Windows)
 
 | 文件 | 个数 | 内容 |
 |---|---|---|
@@ -241,6 +297,7 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | `test_doubao_client.py` | 12 | `ArkDoubao` 对本地假服务器:请求形态、鉴权头、b64 解码、429/401/500/审核/未知 400 的映射、连接失败=未发出、缺密钥/缺模型 |
 | `test_api_style.py` | 2 | 提交校验、帧账本/图片/用量/报告接口、路径参数拒绝穿越 |
 | `test_engine.py` / `test_failures.py` / `test_chaos.py` / `test_smoke.py` | 11 / 14 / 1 / 1 | 引擎:见 8.3 |
+| `test_pipeline_agent.py` | 12 | Pipeline Agent:并行风格化、中断(KeyboardInterrupt 模拟)后 checkpoint 续跑不重复花钱、幂等阶段、跨线程缓存复用、失败重试/升级人工、手册拒绝、参数校验、`ArkChat`(MockTransport)、API |
 | `test_agent_*` / `test_eval.py` / `test_api.py` | 9+19 / 2 / 3 | 旧 Agent 层与基础接口 |
 
 ### 8.2 逐帧流水线的恢复语义(Mock 服务器计费账本为判据)
@@ -375,7 +432,10 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | **内存不足与转码失败未区分** | 见 8.2:`x264 malloc failed` 被归为 `TRANSIENT`,重试 3 次后失败 | 识别资源类错误,走 `RESOURCE` 的更长退避或降低并发 |
 | 质检阈值是手工定的 | 闪烁比 3.0、`dup_thr`、`cut_thr` 都没有在真实素材集上标定;只用 1 个真实素材跑过 | 收集带标注的素材,画阈值-误判曲线 |
 | **没有 VLM 质检** | 题目里的"质量校验 Agent"只有确定性检查;不会判断"人物是否被画崩" | 用多模态模型对关键帧评分,不过的帧只重做该帧 |
-| **Planner/诊断 Agent 没有覆盖新流水线** | 目录里仍是旧 MOCK 阶段;**题目里的 6 类 Agent(任务拆解/调度/执行/质检/自愈/可观测)只有引擎与诊断的雏形** | 扩充 `STAGE_CATALOG` 与评测用例 |
+| **Pipeline Agent 的真实验证很薄** | 只有一次"真实决策模型 + Mock 图像"的成功全流程;**真实 `doubao-seedream-5-0-pro-260628` 从未在流水线里调用**;失败场景下真实模型的决策没验证;没有评测集 | 小额度跑真实 pro;用故障注入对真实模型做一组评测(是否正确重试/升级) |
+| **分阶段 LLM token 是近似归属** | 一轮跨多阶段时平均分摊;推理 token 是否单独计费未核实 | 一阶段一个子 Agent,或每轮只允许一个阶段 |
+| **两套状态不是同一事务** | LangGraph checkpoint 与引擎库分开提交,靠幂等键与按引擎状态重新判断保持一致 | 把 Agent 状态也放进引擎库,或改用 Temporal |
+| **旧 Planner 没有覆盖新流水线** | `STAGE_CATALOG` 仍是旧 MOCK 阶段;Pipeline Agent 取代了它的"拆解/调度"作用,但旧 Planner 代码未删 | 删除旧 Planner 或迁移评测用例 |
 | **Dashboard 没在真实浏览器验证** | 只做了语法检查与接口测试 | Playwright 截图测试 |
 | API 与 Dashboard **无鉴权**,任何人可调用 `approve` | MVP 范围外 | 身份与角色 |
 | 只在 **Windows** 验证 | Linux/macOS 路径(父进程存活监听、`ffmpeg`)未实测 | CI |
@@ -400,5 +460,5 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | 秒级 → 小时级的设计变化 | 📄 `docs/DESIGN.md` 第 9 节 |
 | 结合 AI pipeline 分析哪些步骤适合独立成可恢复任务 | ✅ 第 3、4 节:模型调用步骤内部再做"帧"这一层可恢复粒度 |
 | GPU/外部资源调度与可观测 | ⚠️ 仅"外部并发车道 + 进程内限流 + 用量/预算观测";无装箱/抢占/全局限流 |
-| Agent 层 | ⚠️ 旧 DAG 上已实现,**新流水线未接入**;真实 LLM 未验证 |
+| Agent 层 | ⚠️ **Pipeline Agent**(LangGraph + `doubao-seed-2.1-pro` + 函数调用 + checkpoint 续跑 + 分阶段 token)已接入新流水线并用真实决策模型跑通一次(图像为 Mock);诊断 Agent 已接入;旧 Planner 仍只认旧 DAG;真实图像模型 + 故障场景下的决策**未验证** |
 | 对接真实第三方 API(豆包) | ✅ **跑通一次完整真实任务**(27 张关键帧,Agent Plan + Seedream 5.0 flash);⚠️ 失败路径的真实错误码(429/审核/欠费)未触发过 |

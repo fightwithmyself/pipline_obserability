@@ -194,6 +194,65 @@ CREATE TABLE IF NOT EXISTS diagnoses (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
+
+-- ===== Pipeline Agent(LangGraph 决策 Agent):图状态(messages 等)在 LangGraph checkpointer,下面是可观测的索引 =====
+-- 一次 Agent 运行 = 一个 thread_id
+CREATE TABLE IF NOT EXISTS agent_runs (
+    thread_id  TEXT PRIMARY KEY,
+    status     TEXT NOT NULL,                 -- RUNNING / SUCCEEDED / NEEDS_HUMAN / INTERRUPTED / INCOMPLETE
+    agent_model TEXT,
+    config     TEXT NOT NULL,                 -- 运行配置(不含密钥)
+    request    TEXT,
+    final      TEXT,                          -- Agent 的最终答复
+    error      TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+-- Agent 每一轮决策(一次 LLM 调用):用量来自接口返回的 usage
+CREATE TABLE IF NOT EXISTS agent_turns (
+    thread_id         TEXT NOT NULL,
+    turn              INTEGER NOT NULL,
+    model             TEXT,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    reasoning_tokens  INTEGER,
+    cached_tokens     INTEGER,
+    estimated         INTEGER NOT NULL DEFAULT 0,   -- 1 = 非接口返回的估算值(脚本化策略)
+    latency_s         REAL,
+    content           TEXT,
+    reasoning         TEXT,
+    tool_calls        TEXT,                         -- [{id,name,args}]
+    ts                REAL NOT NULL,
+    PRIMARY KEY (thread_id, turn)
+);
+-- Agent 的每次工具调用
+CREATE TABLE IF NOT EXISTS agent_tool_calls (
+    thread_id    TEXT NOT NULL,
+    call_id      TEXT NOT NULL,
+    turn         INTEGER,
+    name         TEXT NOT NULL,
+    args         TEXT,
+    status       TEXT NOT NULL,                 -- RUNNING / OK / FAILED / ERROR
+    result       TEXT,
+    started_at   REAL,
+    finished_at  REAL,
+    PRIMARY KEY (thread_id, call_id)
+);
+-- 阶段执行记录:一个阶段 = 一个引擎任务(步骤、租约、重试、缓存都由引擎负责)
+CREATE TABLE IF NOT EXISTS agent_stage_runs (
+    thread_id   TEXT NOT NULL,
+    stage_id    TEXT NOT NULL,                  -- ingest / keyframes / stylize:0 / poststats / post:0 / qc / mux / package
+    task_id     TEXT,
+    status      TEXT NOT NULL,                  -- RUNNING / SUCCEEDED / FAILED
+    retries     INTEGER NOT NULL DEFAULT 0,     -- Agent 发起的重试次数
+    outputs     TEXT,                           -- {step_key: {name: {sha256,size}}}
+    summary     TEXT,                           -- 给 LLM 看的精简结果
+    usage       TEXT,                           -- 图像模型用量(来自接口返回的 usage)
+    error       TEXT,
+    started_at  REAL,
+    finished_at REAL,
+    PRIMARY KEY (thread_id, stage_id)
+);
 """
 
 

@@ -157,6 +157,105 @@ def cmd_agent_watch(a) -> int:
     return 0
 
 
+def _make_agent(a):
+    from .agent.agent_llm import ArkChat, ScriptedAgentLLM
+    from .agent.orchestrator import PipelineAgent
+    if a.agent_llm == "scripted":
+        llm = ScriptedAgentLLM(chunks=a.chunks, stride=a.stride, max_gap=a.max_gap)
+    else:
+        if not os.environ.get("ARK_API_KEY"):
+            raise SystemExit("还没有设置环境变量 ARK_API_KEY(密钥只从环境变量读取)")
+        llm = ArkChat(a.agent_model, api="ark_plan")
+    return PipelineAgent(a.data, llm, max_turns=a.max_turns, max_parallel=a.max_parallel)
+
+
+class _Workers:
+    """可选:顺手拉起 N 个 worker 子进程(Agent 只负责决策,干活的是 worker)。"""
+
+    def __init__(self, data: str, n: int):
+        import subprocess
+        self.procs = [subprocess.Popen([sys.executable, "-m", "pipeline.cli", "--data", data, "worker",
+                                        "--id", f"agent-w{i}"]) for i in range(n)]
+
+    def stop(self) -> None:
+        for p in self.procs:
+            p.terminate()
+        for p in self.procs:
+            try:
+                p.wait(10)
+            except Exception:
+                p.kill()
+
+
+def _print_agent_result(out: dict, ag, thread: str) -> int:
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    rep = ag.report(thread)
+    t = rep["totals"]
+    est = "(估算)" if t["llm_estimated"] else ""
+    print(f"\n决策模型 token{est}: 提示 {t['llm_prompt']} + 生成 {t['llm_completion']}(其中推理 {t['llm_reasoning']}),共 {t['llm_turns']} 轮")
+    print(f"图像模型: 调用 {t['seedream_calls']} 次,输出 token {t['seedream_output_tokens']}(复用 {t['seedream_reused_tokens']}),费用估算 ≈ {t['seedream_cost_cny_est']} 元")
+    for s in rep["stages"]:
+        sd = s["seedream"]
+        print(f"  {s['group']:<10} LLM {s['llm_prompt']:.0f}+{s['llm_completion']:.0f}  工具 {s['tool_calls']}  "
+              f"阶段 {len(s['stages'])}  图像 tok {sd['output_tokens']}(复用 {sd['reused_output_tokens']})  耗时 {s['wall_s']}s")
+    return 0 if out["status"] == "SUCCEEDED" else 3
+
+
+def cmd_agent_run(a) -> int:
+    """LangGraph Agent 驱动整条流水线。中断(Ctrl+C/进程被杀)后用 agent-resume 继续。"""
+    cfg = {"source": a.source, "prompt": a.prompt, "provider": a.provider, "model": a.model, "reference": a.reference,
+           "interp": a.interp, "target_height": a.height, "price_cny": a.price, "budget_cny": a.budget,
+           "concurrency": a.concurrency, "on_reject": a.on_reject}
+    cfg = {k: v for k, v in cfg.items() if v is not None}
+    if a.provider == "mock":
+        cfg.pop("model", None)
+    thread = a.thread or f"run-{int(time.time())}"
+    ag = _make_agent(a)
+    ws = _Workers(a.data, a.workers) if a.workers else None
+    try:
+        out = ag.start(thread, cfg, a.request or f"请把视频 {os.path.basename(a.source)} 处理成风格化成品并发布。")
+        return _print_agent_result(out, ag, thread)
+    except KeyboardInterrupt:
+        print(f"\n已中断。继续执行: python -m pipeline.cli agent-resume {thread}", file=sys.stderr)
+        return 130
+    finally:
+        if ws:
+            ws.stop()
+        ag.close()
+
+
+def cmd_agent_resume(a) -> int:
+    ag = _make_agent(a)
+    ws = _Workers(a.data, a.workers) if a.workers else None
+    try:
+        out = ag.resume(a.thread)
+        return _print_agent_result(out, ag, a.thread)
+    except KeyboardInterrupt:
+        print(f"\n已中断。继续执行: python -m pipeline.cli agent-resume {a.thread}", file=sys.stderr)
+        return 130
+    finally:
+        if ws:
+            ws.stop()
+        ag.close()
+
+
+def cmd_agent_status(a) -> int:
+    from .agent.orchestrator import run_report
+    if not a.thread:
+        from .engine import Engine as E
+        e = E(a.data)
+        for r in e.conn.execute("SELECT thread_id,status,agent_model,created_at FROM agent_runs ORDER BY created_at DESC"):
+            print(f"{r['thread_id']:<24} {r['status']:<12} {r['agent_model']}  {_fmt_ts(r['created_at'])}")
+        e.close()
+        return 0
+    rep = run_report(a.data, a.thread)
+    print(json.dumps({"run": {k: rep["run"][k] for k in ("thread_id", "status", "agent_model", "error")},
+                      "totals": rep["totals"]}, ensure_ascii=False, indent=2))
+    for s in rep["stages"]:
+        print(f"  {s['group']:<10} LLM {s['llm_prompt']:.0f}+{s['llm_completion']:.0f} 阶段={[x['stage_id']+':'+x['status'] for x in s['stages']]}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="pipeline")
     p.add_argument("--data", default=DEFAULT_DATA, help="数据目录(含 pipeline.db 与产物)")
@@ -241,6 +340,43 @@ def main(argv: list[str] | None = None) -> int:
     aw.add_argument("--interval", type=float, default=3.0)
     aw.add_argument("--duration", type=float, help="最多运行多少秒(默认一直运行)")
     aw.set_defaults(fn=cmd_agent_watch)
+
+    def agent_opts(x):
+        x.add_argument("--agent-llm", choices=["ark", "scripted"], default="ark",
+                       help="ark=真实决策模型(豆包 Agent Plan);scripted=固定策略的离线替身(测试/无密钥演示,不是智能体)")
+        x.add_argument("--agent-model", default="doubao-seed-2.1-pro")
+        x.add_argument("--max-turns", type=int, default=40)
+        x.add_argument("--max-parallel", type=int, default=8, help="同一轮里并发执行的工具调用上限")
+        x.add_argument("--workers", type=int, default=0, help="顺手拉起 N 个 worker 子进程(0=自己另开 worker)")
+        x.add_argument("--chunks", type=int, default=3, help="仅 scripted 使用")
+        x.add_argument("--stride", type=int, default=6, help="仅 scripted 使用")
+        x.add_argument("--max-gap", type=int, default=24, help="仅 scripted 使用")
+
+    ar = sub.add_parser("agent-run", help="LangGraph 决策 Agent:读取 skill,以函数调用驱动整条流水线(风格化可并行,可中断续跑)")
+    ar.add_argument("--source", required=True)
+    ar.add_argument("--prompt", required=True)
+    ar.add_argument("--request", help="给 Agent 的任务描述(默认自动生成)")
+    ar.add_argument("--thread", help="线程 ID(= 一次运行的标识,续跑用)")
+    ar.add_argument("--provider", choices=["mock", "ark", "ark_plan"], default="mock")
+    ar.add_argument("--model", help="图像模型,如 doubao-seedream-5-0-pro-260628")
+    ar.add_argument("--reference")
+    ar.add_argument("--interp", choices=["mc", "blend"], default="mc")
+    ar.add_argument("--height", type=int, default=1080)
+    ar.add_argument("--price", type=float)
+    ar.add_argument("--budget", type=float, default=20.0)
+    ar.add_argument("--concurrency", type=int, default=4)
+    ar.add_argument("--on-reject", choices=["passthrough", "fail"], default="passthrough")
+    agent_opts(ar)
+    ar.set_defaults(fn=cmd_agent_run)
+
+    arr = sub.add_parser("agent-resume", help="从最近一个 checkpoint 继续被中断的 Agent 运行")
+    arr.add_argument("thread")
+    agent_opts(arr)
+    arr.set_defaults(fn=cmd_agent_resume)
+
+    ast = sub.add_parser("agent-status", help="列出 Agent 运行,或查看某次运行的分阶段 token 报告")
+    ast.add_argument("thread", nargs="?")
+    ast.set_defaults(fn=cmd_agent_status)
 
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

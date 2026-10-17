@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..db import tx
 from ..engine import Engine, InvalidAction, NotFound
+from . import runbook
 from .llm import TracedLLM
 from .planner import parse_json_loose
 from .tools import ToolError, ToolRegistry
@@ -62,9 +63,10 @@ class DiagState(TypedDict, total=False):
 
 
 class DiagnosisAgent:
-    def __init__(self, data_dir: str | Path, engine: Engine, llm: TracedLLM):
+    def __init__(self, data_dir: str | Path, engine: Engine, llm: TracedLLM, *, auto_recover: bool = False):
         self.engine = engine
         self.llm = llm
+        self.auto_recover = auto_recover      # 默认关闭:开启后,手册白名单内的低风险场景不经人确认直接重试
         self.registry = ToolRegistry(engine)
         self._ck_conn = sqlite3.connect(str(Path(data_dir) / "agent_checkpoints.db"), check_same_thread=False)
         self.saver = SqliteSaver(self._ck_conn)
@@ -102,10 +104,37 @@ class DiagnosisAgent:
                      "confidence": 0.0, "explanation": f"校验失败: {str(e)[:200]}", "fallback": True}
             if d["recommended_action"] == "retry_step" and ev["step"]["status"] != "FAILED":
                 d.update(recommended_action="escalate", note=f"步骤当前为 {ev['step']['status']},不是 FAILED,不执行重试")
+            # 处置手册:只限制模型、补充确定性的人工恢复步骤(见 runbook.py)
+            full = next(s for s in eng.get_task(state["task_id"])["steps"] if s["key"] == state["step_key"])
+            pb = runbook.match(full.get("error_kind"), full.get("error_msg"))
+            d.update(playbook=pb.code, human_steps=list(pb.human_steps), attempt_no=full["attempt_no"])
+            if pb is not runbook.GENERIC and d["category"] in ("permanent", "unknown") and not d.get("fallback"):
+                d.update(root_cause=pb.title, category=pb.category)
+            if d["recommended_action"] == "retry_step" and not (pb.auto_retry or pb is runbook.GENERIC):
+                d.update(recommended_action="escalate",
+                         note=f"模型建议重试,但手册判定「{pb.title}」重试无益,改为人工处理")
+            used = self._auto_used(state["task_id"], state["step_key"])
+            d["auto_eligible"] = bool(self.auto_recover and d["recommended_action"] == "retry_step"
+                                      and pb.auto_retry and not d.get("fallback") and used < pb.max_auto)
+            if self.auto_recover and d["recommended_action"] == "retry_step" and pb.auto_retry and used >= pb.max_auto:
+                d["note"] = f"已自动重试 {used} 次仍失败,不再自动重试"
+                d["recommended_action"] = "escalate"
             return {"proposal": d}
 
         def route(state: DiagState) -> str:
-            return "human_gate" if state["proposal"]["recommended_action"] == "retry_step" else "report"
+            p = state["proposal"]
+            if p["recommended_action"] != "retry_step":
+                return "report"
+            return "auto_act" if p.get("auto_eligible") else "human_gate"
+
+        def auto_act(state: DiagState) -> DiagState:
+            # 自我恢复:只有手册白名单内的低风险场景才会走到这里,且受 max_auto 次数限制
+            try:
+                out = reg.call("retry_step", {"task_id": state["task_id"], "key": state["step_key"]}, allow_write=True)
+                return {"result": {"executed": True, "action": "retry_step", "tool_result": out, "by": "agent-auto"}}
+            except ToolError as e:
+                return {"result": {"executed": False, "needs_human": True, "reason": f"tool error: {e}",
+                                   "human_steps": state["proposal"].get("human_steps", [])}}
 
         def human_gate(state: DiagState) -> DiagState:
             # 首次执行到这里会暂停并把 payload 抛给调用方;恢复时 interrupt() 返回人给的决定
@@ -126,20 +155,25 @@ class DiagnosisAgent:
                 return {"result": {"executed": False, "reason": f"tool error: {e}"}}
 
         def report(state: DiagState) -> DiagState:
-            a = state["proposal"]["recommended_action"]
-            return {"result": {"executed": False, "reason": f"建议动作为 {a},不会自动执行,已通知人工"}}
+            p = state["proposal"]
+            return {"result": {"executed": False, "needs_human": True,
+                               "reason": p.get("note") or f"建议动作为 {p['recommended_action']},Agent 无法自行恢复,已标记需要人工处理",
+                               "human_steps": p.get("human_steps", [])}}
 
         g = StateGraph(DiagState)
         g.add_node("collect", collect)
         g.add_node("diagnose", diagnose)
         g.add_node("human_gate", human_gate)
         g.add_node("act", act)
+        g.add_node("auto_act", auto_act)
         g.add_node("report", report)
         g.add_edge(START, "collect")
         g.add_edge("collect", "diagnose")
-        g.add_conditional_edges("diagnose", route, {"human_gate": "human_gate", "report": "report"})
+        g.add_conditional_edges("diagnose", route, {"human_gate": "human_gate", "auto_act": "auto_act",
+                                                    "report": "report"})
         g.add_edge("human_gate", "act")
         g.add_edge("act", END)
+        g.add_edge("auto_act", END)
         g.add_edge("report", END)
         return g
 
@@ -164,7 +198,42 @@ class DiagnosisAgent:
         self._upsert(thread_id, task_id, step_key, "DONE", out["proposal"], None, out["result"], now)
         self.engine.add_event(task_id, "AGENT_DIAGNOSIS", step_key,
                               {"thread_id": thread_id, "proposal": out["proposal"], "awaiting_human": False})
-        return {"thread_id": thread_id, "status": "DONE", "proposal": out["proposal"], "result": out["result"]}
+        res = out["result"]
+        if res.get("executed"):                       # 自我恢复:Agent 自己重试了
+            self.engine.add_event(task_id, "AGENT_ACTION", step_key,
+                                  {"thread_id": thread_id, "by": res.get("by"), "result": res})
+        elif res.get("needs_human"):                  # 无法自行恢复:显式标记,并附人工恢复步骤
+            self.engine.add_event(task_id, "AGENT_NEEDS_HUMAN", step_key,
+                                  {"thread_id": thread_id, "root_cause": out["proposal"]["root_cause"],
+                                   "reason": res.get("reason"), "human_steps": res.get("human_steps", [])})
+        return {"thread_id": thread_id, "status": "DONE", "proposal": out["proposal"], "result": res}
+
+    def _auto_used(self, task_id: str, step_key: str) -> int:
+        n = 0
+        for r in self.engine.conn.execute("SELECT result FROM diagnoses WHERE task_id=? AND step_key=?",
+                                          (task_id, step_key)).fetchall():
+            if r["result"] and json.loads(r["result"]).get("by") == "agent-auto":
+                n += 1
+        return n
+
+    def handle_failures(self, task_id: str | None = None) -> list[dict]:
+        """扫描 FAILED 步骤并逐个诊断(同一次失败只诊断一次,按 attempt_no 去重)。
+        开启 auto_recover 时,低风险场景会被自动重试;再次失败会产生新的 attempt_no,从而再次被诊断,
+        直到次数用尽 → 标记为需要人工。供 CLI `agent-watch` 和看板"诊断全部失败步骤"使用。"""
+        tasks = [self.engine.get_task(task_id)] if task_id else [
+            self.engine.get_task(t["id"]) for t in self.engine.list_tasks(100, "FAILED")]
+        outs = []
+        for t in tasks:
+            for s in t["steps"]:
+                if s["status"] != "FAILED":
+                    continue
+                seen = any((r["proposal"] and json.loads(r["proposal"]).get("attempt_no") == s["attempt_no"])
+                           for r in self.engine.conn.execute(
+                               "SELECT proposal FROM diagnoses WHERE task_id=? AND step_key=?",
+                               (t["id"], s["key"])).fetchall())
+                if not seen:
+                    outs.append({"task_id": t["id"], "step_key": s["key"], **self.start(t["id"], s["key"])})
+        return outs
 
     def resume(self, thread_id: str, approve: bool, comment: str = "", who: str = "human") -> dict:
         row = self.engine.conn.execute("SELECT * FROM diagnoses WHERE thread_id=?", (thread_id,)).fetchone()

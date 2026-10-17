@@ -132,6 +132,31 @@ def cmd_events(a) -> int:
     return 0
 
 
+def cmd_agent_watch(a) -> int:
+    """持续扫描失败步骤并让 Diagnosis Agent 处理:--auto 时低风险场景自动重试,其余标记"需要人工"并打印人工恢复步骤。"""
+    from .agent.diagnosis import DiagnosisAgent
+    from .agent.llm import TracedLLM, make_llm
+    eng = Engine(a.data)
+    ag = DiagnosisAgent(a.data, eng, TracedLLM(make_llm(), eng), auto_recover=a.auto)
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    deadline = time.time() + a.duration if a.duration else None
+    try:
+        while not stop.is_set() and (deadline is None or time.time() < deadline):
+            for o in ag.handle_failures(a.task):
+                p, r = o["proposal"], o.get("result") or {}
+                tag = "自动重试" if r.get("executed") else ("需要人工" if r.get("needs_human") else "等待人工确认")
+                print(f"[{tag}] {o['task_id']}/{o['step_key']}: {p['root_cause']} (手册={p['playbook']})", flush=True)
+                if r.get("needs_human"):
+                    for i, s in enumerate(r.get("human_steps", []), 1):
+                        print(f"    {i}. {s}", flush=True)
+            stop.wait(a.interval)
+    finally:
+        ag.close()
+        eng.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="pipeline")
     p.add_argument("--data", default=DEFAULT_DATA, help="数据目录(含 pipeline.db 与产物)")
@@ -209,6 +234,13 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("task_id", nargs="?")
     ev.add_argument("--after", type=int, default=0)
     ev.set_defaults(fn=cmd_events)
+
+    aw = sub.add_parser("agent-watch", help="失败诊断 Agent:扫描失败步骤,可自动恢复的自动重试,其余标记需要人工并给出恢复步骤")
+    aw.add_argument("--task", help="只处理这个任务(默认所有 FAILED 任务)")
+    aw.add_argument("--auto", action="store_true", help="允许对手册白名单内的低风险失败自动重试(每个步骤最多 2 次)")
+    aw.add_argument("--interval", type=float, default=3.0)
+    aw.add_argument("--duration", type=float, help="最多运行多少秒(默认一直运行)")
+    aw.set_defaults(fn=cmd_agent_watch)
 
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")

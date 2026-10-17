@@ -94,8 +94,9 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
         finally:
             e.close()
 
-    def get_diag(eng: Engine = Depends(get_engine)) -> Iterator[DiagnosisAgent]:
-        a = DiagnosisAgent(data_dir, eng, TracedLLM(llm_factory(), eng))
+    def get_diag(auto: bool = Query(False, description="允许对手册白名单内的低风险失败自动重试(其余仍需人确认或转人工)"),
+                 eng: Engine = Depends(get_engine)) -> Iterator[DiagnosisAgent]:
+        a = DiagnosisAgent(data_dir, eng, TracedLLM(llm_factory(), eng), auto_recover=auto)
         try:
             yield a
         finally:
@@ -448,6 +449,11 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
     @app.post("/api/tasks/{task_id}/steps/{key}/diagnose", status_code=201)
     def diagnose(task_id: str, key: str, agent: DiagnosisAgent = Depends(get_diag)):
         return agent.start(task_id, key)
+
+    @app.post("/api/tasks/{task_id}/diagnose", status_code=201)
+    def diagnose_task(task_id: str, agent: DiagnosisAgent = Depends(get_diag)):
+        """诊断任务里所有 FAILED 步骤(同一次失败只诊断一次)。?auto=true 时低风险场景会被自动重试。"""
+        return {"diagnosed": agent.handle_failures(task_id)}
 
     @app.get("/api/diagnoses")
     def diagnoses(status: str | None = None, task_id: str | None = None, agent: DiagnosisAgent = Depends(get_diag)):

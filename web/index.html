@@ -351,6 +351,8 @@ function renderDetail(t) {
         <span class="muted"> ${t.percent}% · 运行中: ${esc(t.running_steps.join(', ')||'-')}</span></div>
       <div>${wait}
         <button onclick="act('/api/tasks/${t.id}/resume')" ${t.status==='FAILED'?'':'disabled'}>恢复(重试失败步骤)</button>
+        <button onclick="act('/api/tasks/${t.id}/diagnose')" ${t.status==='FAILED'?'':'disabled'} title="Agent 诊断所有失败步骤:只提建议,需要你确认才会重试">AI 诊断失败步骤</button>
+        <button onclick="act('/api/tasks/${t.id}/diagnose?auto=true')" ${t.status==='FAILED'?'':'disabled'} title="手册白名单内的低风险失败(瞬时/内存/部分帧失败)Agent 直接重试,其余标记需要人工">诊断并自动恢复</button>
         <button class="danger" onclick="act('/api/tasks/${t.id}/cancel')" ${['SUCCEEDED','CANCELLED'].includes(t.status)?'disabled':''}>取消</button></div>
     </div>
     <div class="bar ${t.status==='SUCCEEDED'?'ok':t.status==='FAILED'?'bad':''}" style="height:7px;margin:8px 0"><i style="width:${t.percent}%"></i></div>
@@ -440,7 +442,10 @@ async function renderAgent(t) {
     const btns = d.status === 'AWAITING_HUMAN'
       ? `<div style="margin-top:4px"><button onclick="decide('${d.thread_id}',true)">确认执行 ${esc('retry_step')}</button>
          <button class="danger" onclick="decide('${d.thread_id}',false)">拒绝</button></div>`
-      : `<div class="muted">${d.result ? (d.result.executed ? '已执行' : '未执行:' + esc(d.result.reason)) : ''}</div>`;
+      : (d.result && d.result.needs_human
+        ? `<div class="err"><b>⚠ 需要人工处理</b> — ${esc(d.result.reason)}</div>
+           <ol style="margin:2px 0 0 18px;padding:0">${(d.result.human_steps || []).map(s => `<li>${esc(s)}</li>`).join('')}</ol>`
+        : `<div class="muted">${d.result ? (d.result.executed ? '已执行' + (d.result.by === 'agent-auto' ? '(Agent 自动重试)' : '(人确认)') : '未执行:' + esc(d.result.reason)) : ''}</div>`);
     return `<div style="border-bottom:1px solid var(--line);padding:4px 0"><b>${esc(d.step_key)}</b>
       <span class="badge ${d.status==='DONE'?'st-SUCCEEDED':'st-AWAITING_APPROVAL'}">${d.status}</span>
       <div>根因:${esc(p.root_cause)} <span class="muted">(${esc(p.category)}, 置信度 ${p.confidence})</span></div>

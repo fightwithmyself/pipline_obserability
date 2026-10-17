@@ -38,7 +38,7 @@
 ```powershell
 py -3.11 -m venv .venv                       # 虚拟环境,依赖不污染本机
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest -q      # 96 个测试,约 3.5 分钟(含真实 kill -9、混沌测试、真实视频处理)
+.\.venv\Scripts\python.exe -m pytest -q      # 117 个测试,约 3.5 分钟(含真实 kill -9、混沌测试、真实视频处理)
 ```
 
 **离线演示(Mock 模型,不花钱)**:
@@ -93,7 +93,19 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 | 接口/看板 | FastAPI + 单文件 HTML | 核心不依赖它 |
 | 模型 | 豆包 Seedream 图生图(方舟 `POST /api/v3/images/generations`,同步,`b64_json`) | 同步接口没有"任务 id 可续查",所以恢复要靠**自己的逐帧账本**而不是服务端任务 |
 | 视频 | ffmpeg(优先系统的,否则 `imageio-ffmpeg` 自带)+ numpy + Pillow | 不引入 OpenCV |
-| Agent 层(旧) | LangGraph + MCP + OpenAI 兼容客户端 | 见 `docs/AGENT_PLAN.md`;**未接入新流水线** |
+| 流水线编排 | **自写引擎(不是 LangGraph)** | 见下方"为什么不用现成框架" |
+| 失败诊断 Agent | **LangGraph**(`StateGraph` + `interrupt` + `SqliteSaver` checkpoint)+ 自写处置手册 | 只有这一处用 LangGraph:它要"暂停等人确认、进程重启后继续",正好是它的强项;见第 3.5 节 |
+| Planner Agent / MCP | OpenAI 兼容客户端 + MCP | 见 `docs/AGENT_PLAN.md`;Planner **只认旧 Mock DAG,没有接入新流水线** |
+| 观测与 token 统计 | **自建**(SQLite 表 + 看板),未用 LangSmith/Langfuse/OpenTelemetry | 见下方"为什么不用现成框架" |
+
+**为什么不用现成框架(诚实版)**:
+- **编排不用 LangGraph**:LangGraph 是单进程内的图执行与状态保存,不提供本题要考察的东西——租约/心跳、fencing token、崩溃后"可能已计费"的歧义处理、子进程 kill、步骤缓存、跨 worker 调度。
+  这些要靠数据库里的状态机做,我选择自己写并用 117 个测试(含真实 `kill -9`)证明它;代价是**我自己维护了一个调度引擎**,生产环境更应该用 Temporal 等成熟系统。
+  所以这条流水线的"checkpoint/断点恢复"是**引擎自己的**:步骤级 `checkpoint`、逐帧账本、租约回收,**不是 LangGraph checkpoint**。LangGraph 的 checkpoint 只保存 Diagnosis Agent 自己的推理进度。
+- **观测与 token 统计不用现成框架**:这里要统计的是**图像生成接口返回的 `usage`**,并和逐帧账本(调用次数、`maybe_billed`、缓存复用)对账——LangSmith/Langfuse 面向 LLM 对话的 trace,没有"帧"这个维度,也不认 Seedream 的 `output_tokens`;
+  OpenTelemetry/Prometheus/Grafana 能做指标与链路,但需要额外起服务、对账逻辑仍要自己写,与题目"MVP、可解释"的取向不符。
+  代价:**看板是单文件 HTML、轮询而非推送、没有鉴权、没有历史趋势与告警**;LLM 调用(Agent 用的)的追踪表 `llm_calls` 也是"最小自建版"。
+  如果做成生产系统,我会把事件导出为 OpenTelemetry span/metric,看板交给 Grafana,保留账本对账逻辑。这一步**没做**。
 
 **为什么逐帧账本放在文件系统而不是数据库**:恢复时要信任的是"磁盘上已有的、校验过 hash 的结果帧",而不是某个数据库行。
 `ledger/<idx>.json` 与 `styled/<idx>.png` 在步骤的 `work_dir`(跨尝试保留)里;数据库的 `items` 表只是**派生的只读观测视图**(带 fencing 的 upsert,旧 worker 写不进去)。
@@ -108,7 +120,8 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 | `pipeline/media.py` | ffmpeg/ffprobe 封装 |
 | `pipeline/templates.py` | `frame_style_task`(流水线 DAG)、故障注入预设;`animation_swap_task` 是旧 MOCK DAG,**保留为引擎测试夹具** |
 | `pipeline/api.py` + `web/index.html` | REST 与看板 |
-| `pipeline/agent/` + `mcp_server.py` | 旧 Agent 层(规划/诊断/MCP),只认旧 DAG |
+| `pipeline/agent/diagnosis.py` + `runbook.py` | 失败诊断 Agent + 处置手册:已接入新流水线(见 3.5) |
+| `pipeline/agent/planner.py` + `mcp_server.py` | Planner / MCP,只认旧 Mock DAG |
 
 ## 3. 长任务执行、状态管理与失败恢复的设计考量
 
@@ -129,6 +142,44 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
 8. **出了问题怎么办**:每个步骤的"笔记"(note)在成功和失败时都保存,看板里能看到失败那次尝试的帧账本;**产物只在成功时登记**。
 
 **失败场景一览**(详表与测试见第 8 节):单帧瞬时失败 / 限流 / 审核拒绝 / 响应丢失 / 返回乱码 / 步骤崩溃 / worker 被杀 / 密钥失效 / 欠费 / 超预算 / 坏素材 / 素材被替换 / 质检不过。
+
+### 3.5 失败分层:谁来恢复(引擎 / Agent / 人)
+
+| 失败场景 | 引擎自动恢复? | Agent(`--auto`) | 需要人时,Agent 给出的手册 |
+|---|---|---|---|
+| 单帧瞬时错误 / 429 限流 | **是**:帧内退避重试,用尽再引擎级重试 | — | — |
+| worker 被杀 / 租约过期 / 进程崩溃 | **是**:租约回收、从账本续跑 | — | — |
+| 重试预算耗尽的瞬时/超时/卡死/部分帧失败 | 否(FAILED) | **自动重试**,每步最多 2 次 | 超过 2 次 → 标记需要人工,提示看红色帧、降并发、看 stderr |
+| 宿主机内存不足致 ffmpeg 失败 | 重试预算内自动 | **自动重试**(同上) | 提示关程序/查页面文件/看 stderr.log |
+| 鉴权失败(401) | 否,**停止烧钱** | **不重试**,标记需要人工 | 检查 `ARK_API_KEY`、重启 worker、`ark` 与 `ark_plan` 密钥不通用 |
+| 欠费/额度不足 | 否 | 不重试 | 查余额/套餐用量,充值后手动重试 |
+| 模型未开通 / 模型 ID 不存在或已下线 | 否 | 不重试 | 开通模型或换模型重新提交 |
+| 未知 4xx(请求参数被拒) | 否 | 不重试 | 看 code/message 对照参数 |
+| 超预算保护线 | 否(主动停止) | 不重试 | 提高 `--budget` 重新提交(已完成帧不重复计费) |
+| 内容审核拒绝(`on_reject=fail`)/ 降级帧过多 | 否 | 不重试 | `frame_overrides` 换提示词重新提交,或改 `passthrough` |
+| 质检硬失败 | 否 | 不重试 | 看 qc 报告,改参数重新提交 |
+| 坏素材/素材被改 | 否 | 不重试 | 修复素材重新提交 |
+| 反复使 worker 失联(疑似毒丸) | 到次数上限后 FAILED | 不重试 | 先看 worker 日志与 stderr.log 再重试 |
+| 没见过的错误 | 否 | 不重试 | 通用排查步骤 |
+
+**Agent 做了什么**(`pipeline/agent/diagnosis.py`,LangGraph 状态图 `collect → diagnose → {auto_act | human_gate → act | report}`):
+1. **分析**:收集失败步骤的错误、尝试历史、事件,让 LLM 给出根因与建议(默认 `MockLLM` 的规则,配 `OPENAI_API_KEY` 才用真实模型);
+2. **手册**(`runbook.py`)**只限制模型、不放大权限**:模型说"重试"但手册判定无益(鉴权/欠费…)→ 降级为人工;模型输出无法解析 → 绝不执行写操作;
+3. **自我恢复**:只有手册白名单(瞬时、部分帧失败、内存不足)且开启 `--auto`,Agent 才不经人确认直接 `retry_step`,**每个步骤最多 2 次**;
+4. **无法恢复**:写入诊断记录 `result.needs_human=true`,追加事件 `AGENT_NEEDS_HUMAN`(带人工恢复步骤清单),看板"AI 诊断"面板显示"⚠ 需要人工处理"和编号步骤;
+5. **人在回路**:非白名单但模型建议重试的场景,用 LangGraph `interrupt` 暂停等人确认;进程重启后用同一 `thread_id` 继续,**不会重复调用 LLM**;
+6. Agent 只有 `retry_step` 一个写权限,没有批准/取消。同一次失败按 `attempt_no` 只诊断一次。
+
+使用:`python -m pipeline.cli --data data agent-watch --auto`(持续扫描),或看板任务栏"AI 诊断失败步骤 / 诊断并自动恢复"。
+实测(Mock 豆包 + 故障注入,截图 `samples/_out/dashboard_agent_needs_human.png`):`auth_fail` 任务被标记"需要人工"并列出 4 步;
+`rate_limit` 任务(引擎重试预算设为 1 以便走到 FAILED)被 Agent 自动重试后继续执行完成。测试见 `tests/test_agent_runbook.py`。
+
+**必须说清的局限**:
+- 默认是 `MockLLM` 的**规则**,不是真实模型的诊断。没有用真实 LLM 评估过诊断质量,"LLM 理解错误"的部分**未验证**;安全性来自手册与护栏,不来自模型。
+- 手册靠**匹配本项目自己的错误文本**,文本改了要同步改(测试用真实文本做回归);豆包真实的 429/审核/欠费错误码没有触发过,对应分支是按猜测写的。
+- 自动恢复的白名单与"最多 2 次"是我手设的;"没有人在看时能不能自动重试"是安全与便利的取舍,默认关闭。
+- 没有"自动改参数后重试"(例如降并发、换提示词):这类恢复会改变任务含义,只给人工建议。
+- 看板不会主动弹出提醒,需要看"AI 诊断"面板或事件时间线;没有邮件/IM 通知。
 
 ## 4. 任务步骤与依赖关系
 
@@ -182,7 +233,7 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 
 > 所有数字来自本仓库的测试与脚本,可复现。**模型调用均为 Mock**;Mock 服务器的"计费账本"是恢复语义的判据。
 
-### 8.1 测试总览(96 个,全部通过,约 3.5 分钟,Windows)
+### 8.1 测试总览(117 个,全部通过,约 4.5 分钟,Windows)
 
 | 文件 | 个数 | 内容 |
 |---|---|---|

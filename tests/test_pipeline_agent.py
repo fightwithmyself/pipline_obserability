@@ -236,3 +236,26 @@ def test_api_exposes_agent_run_report_and_snapshot(engine, data_dir, clip):
     assert d["totals"]["llm_turns"] == len(d["turns"]) and {s["group"] for s in d["stages"]} >= {"stylize", "qc", "package"}
     assert all(s["status"] == "SUCCEEDED" for s in d["stage_runs"])
     assert c.get("/api/agent/runs/nope").status_code == 404
+
+def test_api_start_and_upload_validation(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from pipeline.api import create_app
+    media = tmp_path / "media"
+    monkeypatch.setenv("PIPELINE_MEDIA_DIR", str(media))
+    monkeypatch.delenv("ARK_API_KEY", raising=False)
+    c = TestClient(create_app(tmp_path / "data"))
+    assert c.get("/api/agent/config").json()["has_ark_key"] is False
+    # 上传:只接受纯文件名与媒体扩展名,不覆盖
+    assert c.post("/api/media?name=a.mp4", content=b"x" * 10).status_code == 201
+    assert c.post("/api/media?name=a.mp4", content=b"x").status_code == 409
+    assert c.post("/api/media?name=..%2Fevil.mp4", content=b"x").status_code == 422
+    assert c.post("/api/media?name=run.exe", content=b"x").status_code == 422
+    assert c.post("/api/media?name=e.mp4", content=b"").status_code == 422
+    assert [m["name"] for m in c.get("/api/media").json()] == ["a.mp4"] and not list(media.glob("_upload*"))
+    # 没有密钥:真实调用在启动子进程之前就被拒绝(不会产生费用)
+    body = {"source": "a.mp4", "prompt": "anime", "provider": "ark_plan", "model": "m"}
+    r = c.post("/api/agent/runs", json=body)
+    assert r.status_code == 422 and "ARK_API_KEY" in r.json()["detail"]
+    assert c.post("/api/agent/runs", json={**body, "source": "../x.mp4"}).status_code == 422
+    assert c.post("/api/agent/runs", json={**body, "source": "nope.mp4"}).status_code == 404
+    assert c.post("/api/agent/runs", json={**body, "provider": "mock", "agent_llm": "scripted", "thread": "bad thread!"}).status_code == 422

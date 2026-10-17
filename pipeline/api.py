@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -62,6 +63,21 @@ class StyleTaskRequest(BaseModel):
     inject: Literal["transient", "crash", "moderation", "response_lost", "rate_limit", "auth_fail"] | None = None
     max_attempts: int = Field(3, ge=1, le=20)
     base_delay: float = Field(2.0, ge=0)
+
+
+class AgentRunRequest(BaseModel):
+    """启动 Pipeline Agent:素材(素材目录下的文件名)+ 风格指令 + 图像模型。"""
+    source: str
+    prompt: str = Field(min_length=1, max_length=2000)
+    provider: Literal["mock", "ark", "ark_plan"] = "ark_plan"
+    model: str | None = None
+    agent_llm: Literal["ark", "scripted"] = "ark"
+    agent_model: str = "doubao-seed-2.1-pro"
+    budget_cny: float = Field(20.0, gt=0, le=10000)
+    target_height: int = Field(720, ge=64, le=2160)
+    concurrency: int = Field(4, ge=1, le=16)
+    workers: int = Field(3, ge=0, le=8)
+    thread: str | None = None
 
 
 class ApprovalRequest(BaseModel):
@@ -495,19 +511,101 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
             e.close()
         return {**rep, "snapshot": snap, "stage_runs": stages}
 
-    @app.post("/api/agent/runs/{thread_id}/resume", status_code=202)
-    def agent_resume(thread_id: str, agent_llm: Literal["ark", "scripted"] = "ark"):
-        """另起子进程从最近的 checkpoint 继续(进程内不跑,避免阻塞 API)。密钥只来自服务进程的环境变量。"""
+    def _spawn_agent(args: list[str], thread_id: str) -> None:
+        """另起子进程运行/继续 Agent(不阻塞 API;日志在 data/agent_logs)。密钥只来自本服务进程的环境变量。"""
         import subprocess
         import sys
+        logs = data_dir / "agent_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        log = open(logs / f"{thread_id}.log", "ab")
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+        subprocess.Popen([sys.executable, "-m", "pipeline.cli", "--data", str(data_dir), *args],
+                         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags,
+                         cwd=str(WEB_DIR.parent))
+        log.close()
+
+    @app.get("/api/agent/config")
+    def agent_config():
+        """面板用:服务进程有没有密钥(只返回布尔值,不返回密钥)与默认模型。"""
+        return {"has_ark_key": bool(os.environ.get("ARK_API_KEY")), "default_agent_model": "doubao-seed-2.1-pro",
+                "default_image_model": "doubao-seedream-5-0-pro-260628",
+                "image_models": ["doubao-seedream-5-0-pro-260628", "doubao-seedream-5-0-flash-260915"]}
+
+    @app.post("/api/agent/runs", status_code=202)
+    def agent_start(req: AgentRunRequest):
+        """用你给的素材与风格启动一次 Pipeline Agent 运行(真实调用会扣额度)。"""
+        import time as _t
+        src = media_path(req.source)
+        if (req.provider != "mock" or req.agent_llm == "ark") and not os.environ.get("ARK_API_KEY"):
+            raise HTTPException(422, "服务进程没有环境变量 ARK_API_KEY:请在启动 API 的终端里设置后重启 API(密钥不会经过网页)")
+        if req.provider != "mock" and not req.model:
+            raise HTTPException(422, "provider 不是 mock 时必须指定图像模型")
+        thread = req.thread or f"run-{int(_t.time())}"
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,60}", thread):
+            raise HTTPException(422, "thread 只能含字母数字下划线连字符")
+        e = Engine(data_dir)
+        try:
+            if e.conn.execute("SELECT 1 FROM agent_runs WHERE thread_id=?", (thread,)).fetchone():
+                raise HTTPException(409, f"线程 {thread} 已存在;要继续请用 resume")
+        finally:
+            e.close()
+        args = ["agent-run", "--source", str(src), "--prompt", req.prompt, "--thread", thread, "--provider", req.provider,
+                "--agent-llm", req.agent_llm, "--agent-model", req.agent_model, "--budget", str(req.budget_cny),
+                "--height", str(req.target_height), "--concurrency", str(req.concurrency), "--workers", str(req.workers)]
+        if req.model:
+            args += ["--model", req.model]
+        _spawn_agent(args, thread)
+        return {"thread_id": thread, "accepted": True}
+
+    @app.post("/api/agent/runs/{thread_id}/resume", status_code=202)
+    def agent_resume(thread_id: str, agent_llm: Literal["ark", "scripted"] = "ark", workers: int = Query(3, ge=0, le=8)):
+        """从最近的 checkpoint 继续(另起子进程)。"""
         from .agent.orchestrator import run_report
         try:
             run_report(data_dir, thread_id)
         except KeyError:
             raise NotFound(f"agent run {thread_id}")
-        subprocess.Popen([sys.executable, "-m", "pipeline.cli", "--data", str(data_dir), "agent-resume", thread_id,
-                          "--agent-llm", agent_llm], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if agent_llm == "ark" and not os.environ.get("ARK_API_KEY"):
+            raise HTTPException(422, "服务进程没有环境变量 ARK_API_KEY")
+        _spawn_agent(["agent-resume", thread_id, "--agent-llm", agent_llm, "--workers", str(workers)], thread_id)
         return {"thread_id": thread_id, "accepted": True}
+
+    @app.get("/api/agent/runs/{thread_id}/log")
+    def agent_log(thread_id: str, tail: int = Query(8000, ge=100, le=100000)):
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,60}", thread_id):
+            raise HTTPException(422, "非法 thread")
+        p = data_dir / "agent_logs" / f"{thread_id}.log"
+        if not p.is_file():
+            return {"log": ""}
+        b = p.read_bytes()[-tail:]
+        return {"log": b.decode("utf-8", errors="replace")}
+
+    @app.post("/api/media", status_code=201)
+    async def upload_media(request: Request, name: str = Query(min_length=1, max_length=120)):
+        """上传素材到素材目录:请求体就是文件内容(不用 multipart)。只接受视频/图片扩展名,限制 1 GB,不覆盖已有文件。"""
+        if Path(name).name != name or name.startswith((".", "_")) or Path(name).suffix.lower() not in MEDIA_EXTS:
+            raise HTTPException(422, f"文件名非法或扩展名不在 {sorted(MEDIA_EXTS)} 内")
+        d = media_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        dest = d / name
+        if dest.exists():
+            raise HTTPException(409, f"素材已存在: {name}(请改名)")
+        tmp = d / f"_upload_{os.getpid()}_{name}"
+        size = 0
+        try:
+            with open(tmp, "wb") as f:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > 1 << 30:
+                        raise HTTPException(413, "文件超过 1 GB")
+                    f.write(chunk)
+            if size == 0:
+                raise HTTPException(422, "空文件")
+            tmp.replace(dest)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return {"name": name, "size_mb": round(size / 1048576, 2)}
 
     # ------------------------------------------------------------ Dashboard
     @app.get("/", include_in_schema=False)

@@ -211,6 +211,10 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
   - `GET /api/agent/runs[/{thread}]` 与看板顶部"Pipeline Agent"面板:分阶段表(决策 token、工具调用、引擎子任务、**图像模型 token**、费用估算、耗时)、决策轮与函数调用时间线、LangGraph 的下一节点/checkpoint 数/消息、"从 checkpoint 继续"按钮;
   - 命令行:`agent-status [thread]`。
 
+**从看板启动**:先在启动 API 的终端里 `$env:ARK_API_KEY="..."`,再 `python -m pipeline.cli --data data api --port 8000`,打开 `http://127.0.0.1:8000/`,
+顶部"Pipeline Agent"面板里选择/上传视频(`POST /api/media`,存到 `samples/`)、填写风格指令、选图像模型与预算后点"启动 Agent"(`POST /api/agent/runs` 另起子进程,日志在 `data/agent_logs/`)。
+服务端没有密钥时真实调用在起子进程之前就被拒绝。
+
 ```powershell
 $env:ARK_API_KEY = "<专属密钥,只放环境变量>"
 .\.venv\Scripts\python.exe -m pipeline.cli agent-run --source samples\cba.mp4 --prompt "日系动漫风格,保持人物与动作不变" `

@@ -132,7 +132,33 @@
   <section>
     <details class="panel" id="agentpanel" style="margin-bottom:12px" open>
       <summary style="cursor:pointer;color:var(--dim);font-weight:600">Pipeline Agent(LangGraph 决策模型 + 函数调用 + checkpoint)</summary>
-      <div id="agentruns" class="muted" style="margin:6px 0">暂无运行。命令行: <code>python -m pipeline.cli agent-run --source samples/xxx.mp4 --prompt "日系动漫风格" --workers 3</code></div>
+      <div style="border:1px solid var(--line);border-radius:6px;padding:8px;margin:8px 0">
+        <b>启动一次运行</b> <span id="a_keystate" class="muted"></span>
+        <div style="display:grid;grid-template-columns:2fr 3fr;gap:8px;margin-top:4px">
+          <div>
+            <label>视频(素材目录 <code>samples/</code>)<select id="a_src"></select></label>
+            <label>或上传新视频 <input type="file" id="a_file" accept="video/*,image/*" style="width:100%"></label>
+            <button onclick="uploadMedia()">上传</button> <span id="a_upmsg" class="muted"></span>
+          </div>
+          <div>
+            <label>风格 / 替换指令(prompt)<textarea id="a_prompt" rows="2" style="width:100%;background:#0f1419;color:var(--txt);border:1px solid var(--line);border-radius:4px;padding:4px">日系动漫风格,保持人物与动作不变,线条清晰</textarea></label>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:4px">
+          <label>图像 provider<select id="a_provider"><option value="ark_plan">ark_plan(真实,扣 Plan 额度)</option><option value="ark">ark(真实,按量付费)</option><option value="mock">mock(离线,不花钱)</option></select></label>
+          <label>图像模型<select id="a_model"></select></label>
+          <label>决策模型<select id="a_llm"><option value="ark">真实 doubao-seed-2.1-pro</option><option value="scripted">脚本策略(离线,非智能体)</option></select></label>
+          <label>预算上限(元,估算)<input type="number" id="a_budget" value="20" min="0.1" step="0.5"></label>
+          <label>输出高度(px)<input type="number" id="a_height" value="720" min="64" max="2160"></label>
+          <label>worker 数<input type="number" id="a_workers" value="3" min="0" max="8"></label>
+        </div>
+        <div style="margin-top:6px"><button onclick="startAgent()">启动 Agent</button>
+          <span id="a_msg" class="muted"></span></div>
+        <div class="muted" style="font-size:11px;margin-top:4px">真实 provider 会调用豆包图像模型并扣额度;素材越长关键帧越多(决策模型会按预算选择抽帧间隔,启动后可在下方看到估算费用)。密钥只在服务端环境变量里,不经过网页。</div>
+      </div>
+      <details style="margin:4px 0"><summary class="muted" style="cursor:pointer">运行日志(命令行输出,启动失败时看这里)</summary>
+        <pre id="a_log" style="white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto;background:#0f1419;padding:6px;margin:3px 0"></pre></details>
+      <div id="agentruns" class="muted" style="margin:6px 0">暂无运行。</div>
       <div id="agentdetail"></div>
     </details>
     <div class="panel" id="detail"><span class="muted">← 选择一个任务</span></div>
@@ -183,9 +209,10 @@ async function submitTask() {
 async function loadMedia() {
   try {
     const list = await api('/api/media');
-    $('m_src').innerHTML = list.length
+    const opts = list.length
       ? list.map(m => `<option value="${esc(m.name)}">${esc(m.name)} (${m.size_mb} MB)</option>`).join('')
       : '<option value="">(samples/ 目录下没有视频)</option>';
+    $('m_src').innerHTML = opts; $('a_src').innerHTML = opts;
   } catch (e) { $('m_msg').innerHTML = '<span class="err">'+esc(e.message)+'</span>'; }
 }
 async function submitStyle() {
@@ -464,6 +491,41 @@ async function renderAgent(t) {
       <td>${esc(c.status)}${c.error?' '+esc(c.error.slice(0,60)):''}</td></tr>`).join('') || '<tr><td colspan=6 class="muted">无调用</td></tr>'}</table>`;
 }
 
+// ---- Pipeline Agent:启动表单
+async function loadAgentForm() {
+  try {
+    const c = await api('/api/agent/config');
+    $('a_keystate').innerHTML = c.has_ark_key ? '<span style="color:var(--ok)">服务端已检测到 ARK_API_KEY</span>'
+      : '<span class="err">服务端没有 ARK_API_KEY:真实调用会被拒绝(请在启动 API 的终端设置后重启)</span>';
+    $('a_model').innerHTML = c.image_models.map(m => `<option>${esc(m)}</option>`).join('');
+  } catch (e) {}
+}
+async function startAgent() {
+  const body = { source: $('a_src').value, prompt: $('a_prompt').value.trim(), provider: $('a_provider').value,
+    model: $('a_provider').value === 'mock' ? null : $('a_model').value, agent_llm: $('a_llm').value,
+    budget_cny: +$('a_budget').value, target_height: +$('a_height').value, workers: +$('a_workers').value };
+  if (!body.source) { $('a_msg').innerHTML = '<span class="err">请选择或上传视频</span>'; return; }
+  if (!body.prompt) { $('a_msg').innerHTML = '<span class="err">请输入风格指令</span>'; return; }
+  try {
+    const r = await api('/api/agent/runs', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)});
+    $('a_msg').textContent = '已启动 ' + r.thread_id + '(几秒后出现在下方)'; selRun = r.thread_id; _runSig = ''; setTimeout(refresh, 1500);
+  } catch (e) { $('a_msg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+}
+async function uploadMedia() {
+  const f = $('a_file').files[0]; if (!f) { $('a_upmsg').textContent = '先选择文件'; return; }
+  $('a_upmsg').textContent = '上传中…';
+  try {
+    const r = await fetch('/api/media?name=' + encodeURIComponent(f.name), {method:'POST', body:f});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    $('a_upmsg').textContent = `已上传 ${j.name} (${j.size_mb} MB)`; await loadMedia(); $('a_src').value = j.name;
+  } catch (e) { $('a_upmsg').innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+}
+async function pollLog() {
+  if (!selRun || !$('a_log').closest('details').open) return;
+  try { const j = await api(`/api/agent/runs/${encodeURIComponent(selRun)}/log`); $('a_log').textContent = j.log || '(没有日志)'; } catch (e) {}
+}
+
 // ---- Pipeline Agent 面板:分阶段 token、工具调用时间线、LangGraph 状态
 let selRun = null, _runSig = '';
 const AST = {RUNNING:'RUNNING', SUCCEEDED:'SUCCEEDED', NEEDS_HUMAN:'FAILED', INTERRUPTED:'RETRY_WAIT', INCOMPLETE:'AWAITING_APPROVAL'};
@@ -518,7 +580,7 @@ async function renderAgentRuns() {
 }
 
 async function refresh() {
-  renderAgentRuns();
+  renderAgentRuns(); pollLog();
   try {
     const [list, m, ws] = await Promise.all([api('/api/tasks'), api('/api/metrics'), api('/api/workers')]);
     renderHeader(m, ws);
@@ -542,7 +604,7 @@ async function refresh() {
 const _pick = pick, _pickStep = pickStep;
 pick = id => { _pick(id); history.replaceState(null, '', '#t=' + id); };
 pickStep = k => { _pickStep(k); history.replaceState(null, '', '#t=' + selTask + '&s=' + k); };
-loadMedia(); refresh(); setInterval(refresh, 1000);
+loadMedia(); loadAgentForm(); refresh(); setInterval(refresh, 1000);
 </script>
 </body>
 </html>

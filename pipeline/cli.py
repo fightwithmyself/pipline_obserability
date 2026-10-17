@@ -71,7 +71,7 @@ def cmd_submit_style(a) -> int:
     try:
         spec = frame_style_task(
             a.name, source=a.source, prompt=a.prompt, provider=a.provider, model=a.model, reference=a.reference,
-            chunks=a.chunks, stride=a.stride, max_gap=a.max_gap, target_height=a.height, price_cny=a.price,
+            chunks=a.chunks, stride=a.stride, interp=a.interp, max_gap=a.max_gap, target_height=a.height, price_cny=a.price,
             budget_cny=a.budget, concurrency=a.concurrency, on_reject=a.on_reject,
             require_approval=a.approval, chaos=chaos,
             retry=RetryPolicy(max_attempts=a.max_attempts, base_delay=a.base_delay, max_delay=60, jitter=0.2))
@@ -179,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("--reference", help="锚点/人物参考图(可选)")
     sv.add_argument("--chunks", type=int, default=4)
     sv.add_argument("--stride", type=int, default=6, help="关键帧间隔(帧);越大越省钱、补间越多")
+    sv.add_argument("--interp", choices=["mc", "blend"], default="mc",
+                    help="补帧方式:mc=按源视频运动搬运关键帧(默认,无重影);blend=线性混合(旧,有重影)")
     sv.add_argument("--max-gap", type=int, default=24)
     sv.add_argument("--height", type=int, default=1080, help="标准化目标高度")
     sv.add_argument("--price", type=float, help="单张价格(元),默认 0.12;只用于估算与预算保护")
@@ -189,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("--max-attempts", type=int, default=3)
     sv.add_argument("--base-delay", type=float, default=2.0)
     sv.add_argument("--chaos", help="JSON 故障注入")
-    sv.add_argument("--inject", choices=["transient", "crash", "moderation", "response_lost", "rate_limit"],
+    sv.add_argument("--inject", choices=["transient", "crash", "moderation", "response_lost", "rate_limit", "auth_fail"],
                     help="故障注入预设(mock)")
     sv.add_argument("--key", help="幂等键")
     sv.set_defaults(fn=cmd_submit_style)

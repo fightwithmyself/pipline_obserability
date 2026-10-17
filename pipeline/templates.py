@@ -108,6 +108,8 @@ def frame_style_inject_presets(chunks: int) -> dict[str, dict[str, dict[str, Any
                                                                           "first_calls": 1}}}}},
         # 第一次尝试里这一帧每次调用都是 429(用完帧级重试机会);引擎重试后恢复正常
         "rate_limit": {"stylize_0": {"doubao": {"frames": {"__first__": {"kind": "rate_limit", "until_attempt": 1}}}}},
+        # 致命错误(如密钥失效):步骤永久失败、任务 FAILED,**需要人工"重试此步骤/恢复"**;第二次尝试时错误消失(模拟已换好密钥)
+        "auth_fail": {f"stylize_{min(2, chunks - 1)}": {"doubao": {"frames": {"__first__": {"kind": "auth", "until_attempt": 1}}}}},
     }
 
 
@@ -118,6 +120,7 @@ def frame_style_task(
     provider: str = "mock",
     model: str | None = None,
     reference: str | None = None,
+    interp: str = "mc",
     chunks: int = 4,
     stride: int = 6,
     max_gap: int = 24,
@@ -164,6 +167,8 @@ def frame_style_task(
         raise ValueError(f"素材格式需要是 {sorted(MEDIA_EXTS)} 之一")
     if not prompt or len(prompt) > 2000:
         raise ValueError("prompt 不能为空,且不超过 2000 字符")
+    if interp not in ("mc", "blend"):
+        raise ValueError("interp 只能是 mc(运动补偿,默认)或 blend(线性混合,旧方法)")
     if provider not in ("mock", "ark", "ark_plan"):
         raise ValueError("provider 只能是 mock、ark 或 ark_plan")
     if provider != "mock" and not model:
@@ -188,11 +193,14 @@ def frame_style_task(
             raise ValueError(f"参考图不存在: {reference}")
         ref_info = {"path": str(rp), "sha256": _sha_file(rp)}
 
+    # 步骤逻辑版本:改了某类步骤的算法就把它加一,否则相同参数会命中旧产物(这次补帧改动就踩到了)
+    versions = {"an_post": "3", "an_qc": "2"}
+
     def mk(key: str, type_: str, deps: list[str], params: dict, *, cacheable: bool = True, resource: str = "cpu",
            timeout_s: float = 1800.0, stall: float | None = None) -> StepSpec:
         return StepSpec(key=key, type=type_, deps=deps, params=params, resource=resource, retry=retry,
                         timeout_s=timeout_s, stall_timeout_s=stall or stall_timeout_s,
-                        cacheable=cacheable, chaos=chaos.get(key, {}))
+                        cacheable=cacheable, chaos=chaos.get(key, {}), version=versions.get(type_, "1"))
 
     summary = {"prompt": prompt, "provider": provider, "model": model, "size": size, "watermark": watermark,
                "price_cny": price, "budget_cny": budget_cny, "has_reference": bool(ref_info),
@@ -220,9 +228,10 @@ def frame_style_task(
     styl = [f"stylize_{i}" for i in range(chunks)]
     steps.append(mk("poststats", "an_poststats", ["keyframes", *styl], {}))
     for i in range(chunks):
-        deps = ["keyframes", "poststats", f"stylize_{i}"] + ([f"stylize_{i + 1}"] if i + 1 < chunks else [])
+        deps = ["ingest", "keyframes", "poststats", f"stylize_{i}"] + ([f"stylize_{i + 1}"] if i + 1 < chunks else [])
         steps.append(mk(f"post_{i}", "an_post", deps,
-                        {"chunk": i, "color_strength": color_strength, "denoise": denoise}))
+                        {"chunk": i, "color_strength": color_strength, "denoise": denoise, "interp": interp},
+                        stall=600.0))
     posts = [f"post_{i}" for i in range(chunks)]
     steps.append(mk("qc", "an_qc", ["ingest", "keyframes", *styl, *posts],
                     {"max_flicker_ratio": max_flicker_ratio, "qc_strict": qc_strict}))

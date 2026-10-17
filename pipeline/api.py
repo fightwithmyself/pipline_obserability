@@ -51,6 +51,7 @@ class StyleTaskRequest(BaseModel):
     reference: str | None = None                  # 素材目录下的参考图文件名(可选)
     chunks: int = Field(4, ge=1, le=16)
     stride: int = Field(6, ge=1, le=240)
+    interp: Literal["mc", "blend"] = "mc"
     max_gap: int = Field(24, ge=1, le=480)
     budget_cny: float = Field(20.0, gt=0, le=10000)
     price_cny: float | None = Field(None, ge=0)
@@ -58,7 +59,7 @@ class StyleTaskRequest(BaseModel):
     on_reject: Literal["passthrough", "fail"] = "passthrough"
     target_height: int = Field(1080, ge=64, le=2160)
     require_approval: bool = False
-    inject: Literal["transient", "crash", "moderation", "response_lost", "rate_limit"] | None = None
+    inject: Literal["transient", "crash", "moderation", "response_lost", "rate_limit", "auth_fail"] | None = None
     max_attempts: int = Field(3, ge=1, le=20)
     base_delay: float = Field(2.0, ge=0)
 
@@ -159,7 +160,7 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
             spec = frame_style_task(
                 req.name, source=str(media_path(req.source)), prompt=req.prompt, provider=req.provider,
                 model=req.model, reference=str(media_path(req.reference)) if req.reference else None,
-                chunks=req.chunks, stride=req.stride, max_gap=req.max_gap, budget_cny=req.budget_cny,
+                chunks=req.chunks, stride=req.stride, interp=req.interp, max_gap=req.max_gap, budget_cny=req.budget_cny,
                 price_cny=req.price_cny, concurrency=req.concurrency, on_reject=req.on_reject,
                 target_height=req.target_height, require_approval=req.require_approval,
                 chaos=frame_style_inject_presets(req.chunks)[req.inject] if req.inject else None,
@@ -180,11 +181,32 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
             raise NotFound(f"{task_id}/{step}")
         return row
 
+    def _frame_items(eng: Engine, task_id: str) -> list[dict]:
+        """逐帧账本。整步命中**步骤缓存**时本任务里没有实际运行过,items 表里没有行:
+        这里按它的产物(styled.zip)补出"DONE、命中缓存、0 次调用"的行,看板才不会是空的。"""
+        import zipfile
+        items = eng.list_items(task_id, prefix="stylize_")
+        have = {it["step_key"] for it in items}
+        for r in eng.conn.execute("SELECT key, outputs FROM steps WHERE task_id=? AND key LIKE 'stylize\\_%' ESCAPE '\\' "
+                                  "AND status='SUCCEEDED'", (task_id,)).fetchall():
+            if r["key"] in have:
+                continue
+            outs = json.loads(r["outputs"] or "{}")
+            if "styled.zip" not in outs:
+                continue
+            with zipfile.ZipFile(eng.store.path(outs["styled.zip"]["sha256"])) as z:
+                names = sorted(n for n in z.namelist() if n.endswith(".png"))
+            for n in names:
+                items.append({"step_key": r["key"], "item_key": n[:-4], "idx": int(n[:-4]), "status": "DONE",
+                              "cached": True, "step_cached": True, "calls": 0, "billed": 0, "maybe_billed": 0,
+                              "output_tokens": 0, "updated_at": 0})
+        return items
+
     @app.get("/api/tasks/{task_id}/frames")
     def task_frames(task_id: str, eng: Engine = Depends(get_engine)):
         """每个关键帧一行:状态、调用次数、用量、是否缓存/降级/可能多付。帧网格用它。"""
         eng.get_task(task_id)
-        items = eng.list_items(task_id, prefix="stylize_")
+        items = _frame_items(eng, task_id)
         by_status: dict[str, int] = {}
         for it in items:
             by_status[it["status"]] = by_status.get(it["status"], 0) + 1
@@ -234,7 +256,7 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
         """用量与费用:按块汇总的接口调用次数、成功计费张数、output_tokens、费用估算与预算。"""
         eng.get_task(task_id)
         per: dict[str, dict] = {}
-        for it in eng.list_items(task_id, prefix="stylize_"):
+        for it in _frame_items(eng, task_id):
             d = per.setdefault(it["step_key"], {"frames": 0, "calls": 0, "billed": 0, "maybe_billed": 0,
                                                 "output_tokens": 0, "cost_cny_est": 0.0, "cost_maybe_extra_cny_est": 0.0,
                                                 "cached": 0, "degraded": 0, "failed": 0})

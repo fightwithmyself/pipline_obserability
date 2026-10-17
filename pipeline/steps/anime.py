@@ -33,6 +33,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ..doubao import (EditResult, FatalError, Moderation, RateLimited, Transient, make_client)
+from ..interp import blend, interpolate
 from ..media import MediaError, count_decoded_frames, ffmpeg_exe, probe_video, run_ffmpeg
 from ..models import ErrorKind, canonical_json
 from ..stepkit import StepContext, StepError
@@ -753,8 +754,9 @@ class _Encoder:
 def an_post(ctx: StepContext) -> None:
     """一块的后处理:颜色匹配 + 轻度去噪 + 在相邻风格化关键帧之间补出其余帧,直接编码成视频片段。
 
-    补间 = 相邻两张风格化关键帧的线性混合。快速运动时会有重影——这是已知局限(换成光流/RIFE 才能解决);
-    镜头切换处不会混合(关键帧选择保证切换点两侧各有一个关键帧,相邻、中间没有补间帧)。
+    补间(interp=mc,默认):用**源视频的运动**把相邻两张风格化关键帧搬到中间时刻再融合(pipeline/interp.py),
+    不再是直接混合,所以运动的人物不会出现双影;interp=blend 保留旧的线性混合(基线/对照)。
+    镜头切换处不会补间(关键帧选择保证切换点两侧各有一个关键帧,相邻、中间没有补间帧)。
     """
     p = ctx.params
     i = int(p["chunk"])
@@ -788,19 +790,45 @@ def an_post(ctx: StepContext) -> None:
 
     # 非最后一块:下一块的第一个关键帧只用来补间,它本身由下一块写出;最后一块要把末帧写出
     anchors = my + ([nxt_first] if nxt_first is not None else [])
+    last_src = anchors[-1]
+    mode = str(p.get("interp", "mc"))
+    src_it = None
+    if mode == "mc":
+        # 按需只解码本块范围内的源帧(select + setpts 重编号,避免 cfr 复制帧);逐帧流式读取,内存只留一个关键帧间隔
+        std = ctx.input_path("ingest", "standard.mp4")
+        src_it = _read_raw_frames(
+            std, f"select='between(n,{f0},{last_src})',setpts=N/{fps}/TB", W * H * 3, "rgb24")
+
+    def next_src() -> np.ndarray:
+        try:
+            return np.frombuffer(next(src_it), np.uint8).reshape(H, W, 3)
+        except StopIteration:
+            raise StepError(ErrorKind.PERMANENT, "标准化素材的帧数少于时间线记录的帧数,无法按源帧补间")
+
     seg = ctx.output_path("seg.mp4")
     enc = _Encoder(seg, W, H, fps, ctx.work_dir / "ffmpeg_post.log")
     try:
         a_idx, A = anchors[0], load(anchors[0])
+        src_a = next_src() if src_it is not None else None
         for j in range(1, len(anchors)):
             enc.write(A)
             b_idx = anchors[j]
             B = load(b_idx)
             if b_idx - a_idx > 1:
-                Af, Bf = A.astype(np.float32), B.astype(np.float32)
-                for f in range(a_idx + 1, b_idx):
-                    t = (f - a_idx) / (b_idx - a_idx)
-                    enc.write(np.clip(np.rint(Af * (1 - t) + Bf * t), 0, 255).astype(np.uint8))
+                if src_it is not None:
+                    mids = [next_src() for _ in range(b_idx - a_idx - 1)]
+                    src_b = next_src()
+                    for k, f in enumerate(range(a_idx + 1, b_idx)):
+                        t = (f - a_idx) / (b_idx - a_idx)
+                        enc.write(interpolate(A, B, src_a, src_b, mids[k], t))
+                        ctx.progress(min(0.95, (f - f0) / max(f1 - f0, 1)), f"post chunk {i}: mc frame {f}")
+                else:
+                    for f in range(a_idx + 1, b_idx):
+                        enc.write(blend(A, B, (f - a_idx) / (b_idx - a_idx)))
+            elif src_it is not None:
+                src_b = next_src()
+            if src_it is not None:
+                src_a = src_b
             ctx.progress(min(0.95, (b_idx - f0) / max(f1 - f0, 1)), f"post chunk {i}: frame {b_idx}")
             a_idx, A = b_idx, B
         if nxt_first is None:
@@ -826,6 +854,28 @@ def second_diff_level(x: np.ndarray) -> float:
     return float(np.median(np.abs(d2)))
 
 
+STRUCT_W = 192             # 结构保真度指标用的灰度缩略图宽度(比亮度分析更大,否则看不出人物的双影)
+
+
+def _edge_map(g: np.ndarray) -> np.ndarray:
+    g = g.astype(np.float32)
+    gx = np.abs(g[:, 2:] - g[:, :-2])[1:-1]
+    gy = np.abs(g[2:, :] - g[:-2, :])[:, 1:-1]
+    return np.sqrt(gx * gx + gy * gy)
+
+
+def structure_scores(out_frames: list[np.ndarray], src_frames: list[np.ndarray]) -> np.ndarray:
+    """逐帧:成品与源帧的"边缘图"归一化互相关(-1..1)。风格化后边缘仍应大体在源边缘的位置;
+    运动补间出现双影时,多出来的边缘会让该帧分数明显低于关键帧。"""
+    out = []
+    for a, b in zip(out_frames, src_frames):
+        ea, eb = _edge_map(a), _edge_map(b)
+        ea, eb = ea - ea.mean(), eb - eb.mean()
+        d = float(np.sqrt((ea * ea).sum() * (eb * eb).sum()))
+        out.append(float((ea * eb).sum() / d) if d > 1e-6 else 0.0)
+    return np.asarray(out, dtype=np.float32)
+
+
 @register("an_qc")
 def an_qc(ctx: StepContext) -> None:
     """确定性质检。硬指标不过 → 永久失败(需要人看);软指标(闪烁、降级比例)只告警,除非 strict。"""
@@ -835,9 +885,10 @@ def an_qc(ctx: StepContext) -> None:
     W, H, fps, n = tl["width"], tl["height"], tl["fps"], tl["n_frames"]
     hard: list[str] = []
     soft: list[str] = []
-    lw = ANALYSIS_W
+    lw = STRUCT_W
     lh = _even(lw * H / W)
     lum: list[float] = []
+    out_small: list[np.ndarray] = []
     frames_total = 0
     for i in range(N):
         seg = ctx.input_path(f"post_{i}", "seg.mp4")
@@ -846,7 +897,9 @@ def an_qc(ctx: StepContext) -> None:
             vi = probe_video(seg)
             cnt = 0
             for buf in _read_raw_frames(seg, f"scale={lw}:{lh}:flags=area,format=gray", lw * lh, "gray"):
-                lum.append(float(np.frombuffer(buf, dtype=np.uint8).mean()))
+                fr = np.frombuffer(buf, dtype=np.uint8).reshape(lh, lw)
+                lum.append(float(fr.mean()))
+                out_small.append(fr)
                 cnt += 1
         except MediaError as e:
             raise StepError(ErrorKind.PERMANENT, f"片段 {i} 无法解码: {e}")
@@ -869,6 +922,26 @@ def an_qc(ctx: StepContext) -> None:
     max_ratio = float(p.get("max_flicker_ratio", 3.0))
     if ratio > max_ratio:
         soft.append(f"亮度闪烁比 {ratio:.2f} 超过 {max_ratio}(成品 {f_out:.2f} / 源 {f_src:.2f};阈值为经验值)")
+    # 结构保真度(能发现补间重影;亮度闪烁指标发现不了):对比成品与源的边缘图
+    struct = None
+    if not hard and len(out_small) == n:
+        try:
+            src_small = [np.frombuffer(b, dtype=np.uint8).reshape(lh, lw) for b in _read_raw_frames(
+                ctx.input_path("ingest", "standard.mp4"), f"scale={lw}:{lh}:flags=area,format=gray", lw * lh, "gray")]
+        except MediaError as e:
+            raise StepError(ErrorKind.PERMANENT, f"标准化素材无法解码: {e}")
+        if len(src_small) == n:
+            sc = structure_scores(out_small, src_small)
+            is_key = np.zeros(n, dtype=bool)
+            is_key[list(tl["keyframes"])] = True
+            if is_key.any() and (~is_key).any():
+                k_mean, m_mean = float(sc[is_key].mean()), float(sc[~is_key].mean())
+                s_ratio = m_mean / max(k_mean, 1e-6)
+                struct = {"keyframes": round(k_mean, 3), "inbetween": round(m_mean, 3), "ratio": round(s_ratio, 3),
+                          "min_ratio": float(p.get("min_structure_ratio", 0.85))}
+                if s_ratio < struct["min_ratio"]:
+                    soft.append(f"补间帧的结构保真度只有关键帧的 {s_ratio:.0%}(<{struct['min_ratio']:.0%}):疑似运动重影"
+                                "(阈值为经验值)")
     # 降级与可能多付(来自工序 3 的用量记录)
     degraded, maybe_dup, billed, cost, maybe_extra, tokens, calls = 0, 0, 0, 0.0, 0.0, 0, 0
     for i in range(N):
@@ -910,6 +983,7 @@ def an_qc(ctx: StepContext) -> None:
     report = {"ok": not hard and (not soft or not strict), "hard_failures": hard, "warnings": soft,
               "frames": frames_total, "expected_frames": n, "size": [W, H],
               "flicker": {"out": round(f_out, 3), "src": round(f_src, 3), "ratio": round(ratio, 3), "max_ratio": max_ratio},
+              "structure": struct,
               "black_frame_ratio": {"out": round(black, 4), "src": round(black_src, 4)},
               "degraded_keyframes": degraded, "maybe_duplicated_frames": maybe_dup,
               "usage": {"calls": calls, "billed_images": billed, "output_tokens": tokens,

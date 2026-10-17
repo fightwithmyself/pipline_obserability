@@ -94,6 +94,7 @@
           <option value="rate_limit">stylize_0 首帧 429 用完重试(只重做这一帧)</option>
           <option value="crash">stylize_0 进程崩溃(复用已完成的帧)</option>
           <option value="response_lost">stylize_0 首帧响应丢失(可能多付一次)</option>
+          <option value="auth_fail">stylize_2 致命错误(密钥失效):任务 FAILED,需手动恢复</option>
           <option value="moderation">stylize_0 首帧被审核拒绝(降级)</option>
         </select></label>
       <label><input type="checkbox" id="m_approval"> 发布前需要人工审批</label>
@@ -467,6 +468,15 @@ async function refresh() {
     }
   } catch (e) { console.warn(e); }
 }
+// 深链接:  http://127.0.0.1:8000/#t=<任务id>&s=<步骤key>  (点击任务/节点时自动更新,可收藏/分享)
+(function () {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get('t')) selTask = h.get('t');
+  if (h.get('s')) selStep = h.get('s');
+})();
+const _pick = pick, _pickStep = pickStep;
+pick = id => { _pick(id); history.replaceState(null, '', '#t=' + id); };
+pickStep = k => { _pickStep(k); history.replaceState(null, '', '#t=' + selTask + '&s=' + k); };
 loadMedia(); refresh(); setInterval(refresh, 1000);
 </script>
 </body>

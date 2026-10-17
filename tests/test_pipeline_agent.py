@@ -259,3 +259,164 @@ def test_api_start_and_upload_validation(tmp_path, monkeypatch):
     assert c.post("/api/agent/runs", json={**body, "source": "../x.mp4"}).status_code == 422
     assert c.post("/api/agent/runs", json={**body, "source": "nope.mp4"}).status_code == 404
     assert c.post("/api/agent/runs", json={**body, "provider": "mock", "agent_llm": "scripted", "thread": "bad thread!"}).status_code == 422
+
+# --------------------------------------------------------------------------- 中断按钮 / 流程图
+def _wait_for(cond, timeout=60.0, step=0.05):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(step)
+    return False
+
+
+def _sql(data_dir, q, *a):
+    from pipeline.engine import Engine
+    e = Engine(data_dir)
+    try:
+        return [dict(r) for r in e.conn.execute(q, a).fetchall()]
+    finally:
+        e.close()
+
+
+def test_soft_interrupt_then_resume_from_checkpoint_without_double_spend(engine, data_dir, clip):
+    from pipeline.agent.stages import RunInterrupted
+    from pipeline.agent.orchestrator import pipeline_graph
+    from pipeline.db import tx
+    agent = make_agent(data_dir)
+    box = {}
+
+    def go():
+        try:
+            box["out"] = agent.start("itr", cfg_for(clip), "x")
+        except BaseException as e:  # noqa: BLE001
+            box["exc"] = e
+
+    with WorkerPool(data_dir, n=3):
+        th = threading.Thread(target=go)
+        th.start()
+        # 等到风格化阶段已经开始,再请求中断(模拟点击"中断"按钮)
+        assert _wait_for(lambda: any(r["stage_id"].startswith("stylize") for r in
+                                     _sql(data_dir, "SELECT stage_id FROM agent_stage_runs WHERE thread_id='itr'")))
+        from pipeline.engine import Engine
+        e = Engine(data_dir)
+        with tx(e.conn):
+            e.conn.execute("UPDATE agent_runs SET status='INTERRUPTING' WHERE thread_id='itr'")
+        e.close()
+        th.join(timeout=120)
+        assert not th.is_alive()
+        assert isinstance(box.get("exc"), RunInterrupted), box
+        assert _sql(data_dir, "SELECT status FROM agent_runs WHERE thread_id='itr'")[0]["status"] == "INTERRUPTED"
+        g = pipeline_graph(data_dir, "itr", alive=False)
+        by = {n["id"]: n["status"] for n in g["nodes"]}
+        assert by["skill"] == "SUCCEEDED" and by["ingest"] == "SUCCEEDED" and by["package"] == "PENDING"
+        assert g["stopped"] is True
+        turns_before = len(_sql(data_dir, "SELECT turn FROM agent_turns WHERE thread_id='itr'"))
+        # 从 checkpoint 继续
+        out = agent.resume("itr")
+    assert out["status"] == "SUCCEEDED"
+    rep = run_report(data_dir, "itr")
+    n_kf = next(s for s in _sql(data_dir, "SELECT summary FROM agent_stage_runs WHERE thread_id='itr' AND stage_id='keyframes'"))
+    n_kf = json.loads(n_kf["summary"])["n_keyframes"]
+    assert len(billing(data_dir)) == n_kf, "中断/续跑期间每个关键帧只能调用一次图像模型"
+    assert rep["totals"]["llm_turns"] >= turns_before
+    assert all(n["status"] == "SUCCEEDED" for n in pipeline_graph(data_dir, "itr", alive=False)["nodes"])
+
+
+def test_pipeline_graph_template_and_finished_run(engine, data_dir, clip):
+    from pipeline.agent.orchestrator import pipeline_graph
+    t = pipeline_graph(None, None)
+    assert [n["id"] for n in t["nodes"]][:3] == ["skill", "ingest", "keyframes"] and all(n["status"] == "PENDING" for n in t["nodes"])
+    agent = make_agent(data_dir)
+    with WorkerPool(data_dir, n=3):
+        assert agent.start("g", cfg_for(clip), "x")["status"] == "SUCCEEDED"
+    g = pipeline_graph(data_dir, "g", alive=False)
+    ids = [n["id"] for n in g["nodes"]]
+    assert g["chunks"] == 2 and {"stylize:0", "stylize:1", "post:0", "post:1"} <= set(ids)
+    assert all(n["status"] == "SUCCEEDED" for n in g["nodes"]) and not g["stopped"]
+    assert next(n for n in g["nodes"] if n["id"] == "qc")["deps"] == ["post:0", "post:1"]
+
+
+def test_pid_helpers():
+    import os
+    import subprocess
+    import sys
+    from pipeline.proc import kill_tree, pid_alive
+    assert pid_alive(os.getpid()) and not pid_alive(0) and not pid_alive(2 ** 22 + 12345)
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    assert pid_alive(p.pid)
+    kill_tree(p.pid)
+    p.wait(timeout=10)
+    assert not pid_alive(p.pid)
+
+
+def test_api_interrupt_and_resume_guards(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    from fastapi.testclient import TestClient
+    from pipeline.api import create_app
+    from pipeline.db import tx
+    from pipeline.engine import Engine
+    data = tmp_path / "data"
+    monkeypatch.setenv("ARK_API_KEY", "dummy")
+    spawned = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: spawned.append(a[0]) or None)
+    c = TestClient(create_app(data))
+    e = Engine(data)
+    with tx(e.conn):
+        for t, st in (("dead", "RUNNING"), ("done", "SUCCEEDED"), ("live", "RUNNING")):
+            e.conn.execute("INSERT INTO agent_runs(thread_id,status,agent_model,config,request,created_at,updated_at) "
+                           "VALUES (?,?,?,?,?,?,?)", (t, st, "m", json.dumps({"source": "x"}), "r", 1.0, 1.0))
+    e.close()
+    (data / "agent_logs").mkdir(parents=True)
+    (data / "agent_logs" / "live.pid").write_text(str(os.getpid()))        # 假装 live 的进程还活着(用测试进程自己)
+    runs = {r["thread_id"]: r for r in c.get("/api/agent/runs").json()}
+    assert runs["dead"]["effective_status"] == "INTERRUPTED" and runs["live"]["effective_status"] == "RUNNING"
+    # 进程已不在:中断 = 直接标记 INTERRUPTED;之后允许继续
+    assert c.post("/api/agent/runs/dead/interrupt").json()["status"] == "INTERRUPTED"
+    assert c.post("/api/agent/runs/dead/resume?agent_llm=scripted").status_code == 202 and spawned
+    # 已结束的不能中断;进程还活着的不能重复继续;不存在的 404
+    assert c.post("/api/agent/runs/done/interrupt").status_code == 409
+    assert c.post("/api/agent/runs/live/resume?agent_llm=scripted").status_code == 409
+    assert c.post("/api/agent/runs/nope/interrupt").status_code == 404
+    assert c.get("/api/agent/graph").json()["nodes"][0]["id"] == "skill"
+
+
+def test_real_process_interrupt_via_api_then_cli_resume(tmp_path, clip, monkeypatch):
+    """真实子进程:CLI 跑 Agent(含 worker 子进程)→ API 中断(软中断 + 立即强杀兜底)→ CLI 继续 → 成功,图像模型不重复调用。"""
+    import os
+    import subprocess
+    import sys
+    from fastapi.testclient import TestClient
+    from pipeline.api import create_app
+    from pipeline.proc import pid_alive
+    data = tmp_path / "data"
+    root = Path(__file__).resolve().parent.parent
+    base = [sys.executable, "-m", "pipeline.cli", "--data", str(data)]
+    monkeypatch.delenv("ARK_API_KEY", raising=False)
+    c = TestClient(create_app(data))
+    common = ["--agent-llm", "scripted", "--chunks", "2", "--stride", "3", "--max-gap", "8", "--workers", "2"]
+    p = subprocess.Popen(base + ["agent-run", "--source", str(clip), "--prompt", "anime", "--thread", "rp",
+                                 "--provider", "mock", "--height", "108", *common], cwd=str(root),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert _wait_for(lambda: any(r["stage_id"].startswith("stylize") for r in
+                                     _sql(data, "SELECT stage_id FROM agent_stage_runs WHERE thread_id='rp'")), 120)
+        pid = int((data / "agent_logs" / "rp.pid").read_text())
+        assert pid_alive(pid)            # Windows venv 里 Popen 拿到的是启动器 pid,CLI 真实 pid 以 pid 文件为准
+        r = c.post("/api/agent/runs/rp/interrupt?force_after_s=0")
+        assert r.status_code == 202
+        p.wait(timeout=60)                                              # 进程(树)被终止
+        assert _wait_for(lambda: c.get("/api/agent/runs/rp").json()["effective_status"] == "INTERRUPTED", 30)
+        d = c.get("/api/agent/runs/rp").json()
+        assert d["alive"] is False and d["graph"]["stopped"] is True
+        assert d["snapshot"]["checkpoints"] >= 3                        # checkpoint 在
+    finally:
+        if p.poll() is None:
+            p.kill()
+    p2 = subprocess.run(base + ["agent-resume", "rp", *common], cwd=str(root), capture_output=True, timeout=600)
+    assert p2.returncode == 0, p2.stderr.decode("utf-8", "replace")[-800:]
+    d = c.get("/api/agent/runs/rp").json()
+    assert d["run"]["status"] == "SUCCEEDED" and all(n["status"] == "SUCCEEDED" for n in d["graph"]["nodes"])
+    n_kf = json.loads(_sql(data, "SELECT summary FROM agent_stage_runs WHERE thread_id='rp' AND stage_id='keyframes'")[0]["summary"])["n_keyframes"]
+    assert d["totals"]["seedream_calls"] <= n_kf + 2     # 硬杀时在途的请求属于"可能多付"(账本会记),这里只做上界检查

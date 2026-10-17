@@ -34,7 +34,7 @@ from ..engine import Engine
 from ..templates import frame_style_task
 from .agent_llm import AgentLLM
 from .pipeline_tools import PipelineToolRegistry, ToolContext, build_tools, compact
-from .stages import GROUPS, StageRunner, frame_kwargs
+from .stages import GROUPS, RunInterrupted, StageRunner, frame_kwargs, interrupt_requested
 
 SYSTEM_PROMPT = """你是视频风格化流水线的决策 Agent。你通过工具(function calling)驱动一条 6 道工序的流水线,把用户的视频逐帧做风格化/人物替换,再合成成品。
 
@@ -107,6 +107,8 @@ class PipelineAgent:
             turn = int(state.get("turns", 0)) + 1
             if turn > self.max_turns:
                 return {"messages": [AIMessage(content=f"已达到最大决策轮数 {self.max_turns},停止。")], "turns": turn}
+            if interrupt_requested(self.data_dir, tid):          # 轮与轮之间检查:不再发起新的模型调用
+                raise RunInterrupted("用户请求中断,未发起新一轮决策")
             t0 = self.clock()
             ai = self.llm.chat(state["messages"], specs)
             self._record_turn(tid, turn, ai, self.clock() - t0)
@@ -370,3 +372,107 @@ def run_report(data_dir: str | Path, thread_id: str) -> dict:
                             "args": json.loads(c["args"] or "{}"),
                             "duration_s": round((c["finished_at"] or 0) - (c["started_at"] or 0), 2) if c["finished_at"] else None}
                            for c in calls]}
+
+
+# ============================================================================ 流程图(只读,API 也用)
+NODE_LABELS = {"skill": "读取 skill", "ingest": "1 摄取", "keyframes": "2 关键帧", "poststats": "4a 统计",
+               "qc": "5 质检", "mux": "5 合成音频", "package": "6 打包发布"}
+_TOOL_STAGE = {"load_skill": "skill", "ingest_video": "ingest", "extract_keyframes": "keyframes",
+               "poststats": "poststats", "quality_check": "qc", "mux_audio": "mux", "package_and_publish": "package"}
+
+
+def _node_for_call(name: str, args: dict) -> str | None:
+    if name in _TOOL_STAGE:
+        return _TOOL_STAGE[name]
+    if name == "stylize_chunk":
+        return f"stylize:{args.get('chunk')}"
+    if name == "postprocess_chunk":
+        return f"post:{args.get('chunk')}"
+    return None
+
+
+def pipeline_graph(data_dir: str | Path | None, thread_id: str | None, alive: bool | None = None) -> dict:
+    """流水线流程图:节点 = 阶段(风格化/后处理按分块展开),状态来自阶段记录与工具调用记录。
+
+    thread_id 为 None 时返回"模板"(全部待执行),任务一开始就能先看到整条流程。
+    状态:PENDING / RUNNING / SUCCEEDED / FAILED / INTERRUPTED(运行被中断时仍在执行中的节点)。
+    """
+    stages: dict[str, dict] = {}
+    calls: list[dict] = []
+    run: dict | None = None
+    progress: dict[str, dict] = {}
+    if thread_id and data_dir:
+        e = Engine(data_dir)
+        try:
+            rr = _rows(e.conn, "SELECT status, error, updated_at FROM agent_runs WHERE thread_id=?", thread_id)
+            run = rr[0] if rr else None
+            for r in _rows(e.conn, "SELECT * FROM agent_stage_runs WHERE thread_id=?", thread_id):
+                stages[r["stage_id"]] = r
+            calls = _rows(e.conn, "SELECT name,args,status,started_at,finished_at FROM agent_tool_calls "
+                                  "WHERE thread_id=? ORDER BY started_at", thread_id)
+            for sid, r in stages.items():                                   # 执行中的阶段:引擎里的实时进度
+                if r["status"] == "RUNNING" and r["task_id"]:
+                    try:
+                        t = e.get_task(r["task_id"])
+                    except Exception:  # noqa: BLE001
+                        continue
+                    run_steps = [s for s in t["steps"] if s["status"] in ("RUNNING", "RETRY_WAIT")]
+                    progress[sid] = {"percent": t["percent"],
+                                     "msg": next((s["progress_msg"] for s in run_steps if s.get("progress_msg")), None),
+                                     "running": [s["key"] for s in run_steps]}
+        finally:
+            e.close()
+    summary = json.loads(stages["keyframes"]["summary"]) if "keyframes" in stages and stages["keyframes"]["summary"] else None
+    n = int(summary["chunks"]) if summary else None
+    if n is None:                                                          # 分块数还没定:看工具调用里的参数
+        for c in calls:
+            if c["name"] == "extract_keyframes":
+                n = int(json.loads(c["args"] or "{}").get("chunks") or 0) or None
+    last: dict[str, dict] = {}
+    for c in calls:
+        nid = _node_for_call(c["name"], json.loads(c["args"] or "{}"))
+        if nid:
+            last[nid] = c
+    stopped = bool(run) and (run["status"] in ("INTERRUPTED", "INTERRUPTING") or (run["status"] == "RUNNING" and alive is False))
+
+    def status_of(nid: str) -> str:
+        s = stages.get(nid)
+        st = "PENDING"
+        if s:
+            st = s["status"]
+        elif nid in last:
+            c = last[nid]
+            st = "RUNNING" if c["status"] == "RUNNING" else ("SUCCEEDED" if c["status"] == "OK" else "FAILED")
+        if st == "RUNNING" and stopped:
+            st = "INTERRUPTED"
+        return st
+
+    nodes: list[dict] = []
+
+    def add(nid: str, label: str, col: int, row: int, deps: list[str]) -> None:
+        s = stages.get(nid)
+        nodes.append({"id": nid, "label": label, "col": col, "row": row, "deps": deps, "status": status_of(nid),
+                      "task_id": s["task_id"] if s else None, "retries": s["retries"] if s else 0,
+                      "progress": progress.get(nid)})
+
+    add("skill", NODE_LABELS["skill"], 0, 0, [])
+    add("ingest", NODE_LABELS["ingest"], 1, 0, ["skill"])
+    add("keyframes", NODE_LABELS["keyframes"], 2, 0, ["ingest"])
+    if n:
+        for i in range(n):
+            add(f"stylize:{i}", f"3 风格化 #{i}", 3, i, ["keyframes"])
+    else:
+        add("stylize:*", "3 风格化(分块并行)", 3, 0, ["keyframes"])
+    add("poststats", NODE_LABELS["poststats"], 4, 0, [f"stylize:{i}" for i in range(n)] if n else ["stylize:*"])
+    if n:
+        for i in range(n):
+            add(f"post:{i}", f"4b 后处理 #{i}", 5, i, ["poststats"])
+    else:
+        add("post:*", "4b 后处理(分块并行)", 5, 0, ["poststats"])
+    post_ids = [f"post:{i}" for i in range(n)] if n else ["post:*"]
+    add("qc", NODE_LABELS["qc"], 6, 0, post_ids)
+    add("mux", NODE_LABELS["mux"], 7, 0, ["qc"])
+    add("package", NODE_LABELS["package"], 8, 0, ["mux"])
+    active = [x["id"] for x in nodes if x["status"] in ("RUNNING", "INTERRUPTED")]
+    return {"nodes": nodes, "chunks": n, "stopped": stopped, "active": active,
+            "interrupted_at": [x["id"] for x in nodes if x["status"] == "INTERRUPTED"]}

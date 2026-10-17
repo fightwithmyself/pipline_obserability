@@ -15,6 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .agent.diagnosis import DiagnosisAgent
+from .agent.orchestrator import pipeline_graph
+from .db import tx
 from .agent.llm import TracedLLM, list_llm_calls, llm_usage_summary, make_llm
 from .agent.planner import Planner, get_plan, list_plans
 from .engine import Engine, EngineError, InvalidAction, NotFound
@@ -484,7 +486,13 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
     def agent_runs(eng: Engine = Depends(get_engine)):
         rows = eng.conn.execute("SELECT thread_id,status,agent_model,request,error,created_at,updated_at "
                                 "FROM agent_runs ORDER BY created_at DESC LIMIT 100").fetchall()
-        return [{k: r[k] for k in r.keys()} for r in rows]
+        out = []
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            d["alive"] = _agent_pid(d["thread_id"])[1]
+            d["effective_status"] = "INTERRUPTED" if d["status"] in ("RUNNING", "INTERRUPTING") and not d["alive"] else d["status"]
+            out.append(d)
+        return out
 
     @app.get("/api/agent/runs/{thread_id}")
     def agent_run(thread_id: str):
@@ -509,7 +517,71 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
                                "error": r["error"]})
         finally:
             e.close()
-        return {**rep, "snapshot": snap, "stage_runs": stages}
+        alive = _agent_pid(thread_id)[1]
+        st = rep["run"]["status"]
+        graph = pipeline_graph(data_dir, thread_id, alive)
+        # 进程不在了、记录却还是 RUNNING:说明被强杀/崩溃,对用户就是"已中断,可继续"
+        eff = "INTERRUPTED" if st in ("RUNNING", "INTERRUPTING") and not alive else st
+        return {**rep, "snapshot": snap, "stage_runs": stages, "alive": alive, "effective_status": eff, "graph": graph}
+
+    def _agent_pid(thread_id: str) -> tuple[int, bool]:
+        from .proc import pid_alive
+        pf = data_dir / "agent_logs" / f"{thread_id}.pid"
+        try:
+            pid = int(pf.read_text().strip())
+        except (OSError, ValueError):
+            return 0, False
+        return pid, pid_alive(pid)
+
+    @app.get("/api/agent/graph")
+    def agent_graph_template():
+        """流程图模板(全部待执行):还没有任何运行时也能先看到整条流水线。"""
+        return pipeline_graph(None, None)
+
+    @app.post("/api/agent/runs/{thread_id}/interrupt", status_code=202)
+    def agent_interrupt(thread_id: str, force_after_s: float = Query(20.0, ge=0, le=600)):
+        """中断一次运行。先"软中断":置 INTERRUPTING,Agent 在下一个检查点(轮与轮之间、等待阶段的轮询里)停下并保存状态;
+        超过 force_after_s 还没停(例如卡在一次模型请求里),就强杀整个进程树。两种情况都可以之后从 checkpoint 继续。"""
+        import threading
+        import time as _t
+        from .proc import kill_tree, pid_alive
+        e = Engine(data_dir)
+        try:
+            row = e.conn.execute("SELECT status FROM agent_runs WHERE thread_id=?", (thread_id,)).fetchone()
+            if row is None:
+                raise NotFound(f"agent run {thread_id}")
+            pid, alive = _agent_pid(thread_id)
+            if row["status"] not in ("RUNNING", "INTERRUPTING"):
+                raise HTTPException(409, f"当前状态 {row['status']},没有在运行的进程可中断")
+            new = "INTERRUPTING" if alive else "INTERRUPTED"
+            with tx(e.conn):
+                e.conn.execute("UPDATE agent_runs SET status=?, error=?, updated_at=? WHERE thread_id=?",
+                               (new, None if alive else "进程已不在(被强杀或崩溃)", _t.time(), thread_id))
+        finally:
+            e.close()
+        if not alive:
+            return {"thread_id": thread_id, "status": "INTERRUPTED", "forced": False}
+
+        def _watchdog() -> None:
+            deadline = _t.time() + force_after_s
+            while _t.time() < deadline and pid_alive(pid):
+                _t.sleep(0.5)
+            if pid_alive(pid):
+                kill_tree(pid)
+                for _ in range(20):
+                    if not pid_alive(pid):
+                        break
+                    _t.sleep(0.2)
+                e2 = Engine(data_dir)
+                try:
+                    with tx(e2.conn):
+                        e2.conn.execute("UPDATE agent_runs SET status='INTERRUPTED', error=?, updated_at=? WHERE thread_id=?",
+                                        (f"超过 {force_after_s:.0f}s 未响应软中断,已强制终止进程树", _t.time(), thread_id))
+                finally:
+                    e2.close()
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+        return {"thread_id": thread_id, "status": "INTERRUPTING", "force_after_s": force_after_s}
 
     def _spawn_agent(args: list[str], thread_id: str) -> None:
         """另起子进程运行/继续 Agent(不阻塞 API;日志在 data/agent_logs)。密钥只来自本服务进程的环境变量。"""
@@ -565,6 +637,8 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
             run_report(data_dir, thread_id)
         except KeyError:
             raise NotFound(f"agent run {thread_id}")
+        if _agent_pid(thread_id)[1]:
+            raise HTTPException(409, "该运行的进程还在执行,不能重复继续(先中断,或等它结束)")
         if agent_llm == "ark" and not os.environ.get("ARK_API_KEY"):
             raise HTTPException(422, "服务进程没有环境变量 ARK_API_KEY")
         _spawn_agent(["agent-resume", thread_id, "--agent-llm", agent_llm, "--workers", str(workers)], thread_id)

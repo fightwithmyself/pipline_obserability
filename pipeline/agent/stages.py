@@ -30,6 +30,20 @@ TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED")
 GROUPS = ["plan", "ingest", "keyframes", "stylize", "poststats", "post", "qc", "mux", "package", "control"]
 
 
+class RunInterrupted(BaseException):
+    """用户请求中断。继承 BaseException:工具层的 `except Exception` 不会把它当成普通错误吞掉,
+    LangGraph 会让它一路抛出,运行记为 INTERRUPTED,之后可从最近的 checkpoint 继续。"""
+
+
+def interrupt_requested(data_dir: str | Path, thread_id: str) -> bool:
+    eng = Engine(data_dir)
+    try:
+        r = eng.conn.execute("SELECT status FROM agent_runs WHERE thread_id=?", (thread_id,)).fetchone()
+        return bool(r) and r["status"] == "INTERRUPTING"
+    finally:
+        eng.close()
+
+
 class StageError(Exception):
     """阶段无法提交(上游未完成、参数不合法等)。信息会原样回给 LLM。"""
 
@@ -148,6 +162,8 @@ class StageRunner:
     # ---------------------------------------------------------------- 执行
     def run(self, stage_id: str, *, params: dict | None = None, frame_overrides: dict | None = None) -> dict:
         params = params or {}
+        if interrupt_requested(self.data_dir, self.thread_id):
+            raise RunInterrupted(f"用户请求中断,未提交阶段 {stage_id}")
         eng = Engine(self.data_dir)
         try:
             rows = self._rows(eng)
@@ -203,6 +219,8 @@ class StageRunner:
             t = eng.get_task(task_id)
             if t["status"] in TERMINAL:
                 break
+            if interrupt_requested(self.data_dir, self.thread_id):
+                raise RunInterrupted(f"用户在等待阶段 {stage_id} 时请求中断")
             if self.clock() > deadline:
                 raise StageError(f"阶段 {stage_id} 等待超时({self.timeout_s:.0f}s);任务 {task_id} 仍在引擎里运行,可稍后重新调用同一工具继续等待")
             time.sleep(self.poll)

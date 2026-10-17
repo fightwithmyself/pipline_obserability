@@ -39,7 +39,7 @@
 ```powershell
 py -3.11 -m venv .venv                       # 虚拟环境,依赖不污染本机
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest -q      # 129 个测试,约 5 分钟(含真实 kill -9、混沌测试、真实视频处理)
+.\.venv\Scripts\python.exe -m pytest -q      # 135 个测试,约 7 分钟(含真实 kill -9、混沌测试、真实视频处理)
 ```
 
 **离线演示(Mock 模型,不花钱)**:
@@ -210,6 +210,12 @@ Agent Plan 按套餐额度抵扣而不是按元计费,所以下面的"元"只是
   - 表 `agent_runs / agent_turns / agent_tool_calls / agent_stage_runs` 记录每一轮决策的 token(接口返回的 `usage`,含推理 token、缓存命中)、工具调用、阶段状态;
   - `GET /api/agent/runs[/{thread}]` 与看板顶部"Pipeline Agent"面板:分阶段表(决策 token、工具调用、引擎子任务、**图像模型 token**、费用估算、耗时)、决策轮与函数调用时间线、LangGraph 的下一节点/checkpoint 数/消息、"从 checkpoint 继续"按钮;
   - 命令行:`agent-status [thread]`。
+- **流程图与中断按钮**(看板顶部,没有任何运行时也先显示整条流程):节点 = 读取 skill → 摄取 → 关键帧 → 风格化 #0..#N(并行)→ 统计 → 后处理 #0..#N(并行)→ 质检 → 合成 → 发布,
+  状态(待执行/执行中+进度/完成/失败/已中断)来自阶段记录与工具调用记录,每秒刷新,点击节点跳到对应引擎任务的 DAG。
+  "⏸ 中断"= **软中断优先、硬杀兜底**:先把运行置为 `INTERRUPTING`,Agent 在检查点停下(两轮决策之间、等待阶段的轮询里、提交阶段之前),保存 checkpoint,状态记为 `INTERRUPTED`;
+  20 秒内没停下(例如卡在一次模型请求里)就强制终止整个进程树(Agent + 它拉起的 worker)。中断处的节点显示为橙色虚线框;"▶ 从 checkpoint 继续"= `agent-resume`。
+  Agent 进程被强杀/崩溃、记录仍是 RUNNING 时,看板按"进程已不在"显示为已中断并允许继续;进程还活着时拒绝重复继续(pid 文件 + 存活探测)。
+  **中断的代价**:软中断只停下 Agent,**正在途中的图像请求在 worker 被终止时会被丢弃**,恢复时这些帧可能重新请求(账本会标出"可能多付");如果 worker 是你另外启动的(`--workers 0`),软中断不会停掉它们,已提交的阶段会继续跑完(继续花钱),需要自己停 worker。
 
 **从看板启动**:先在启动 API 的终端里 `$env:ARK_API_KEY="..."`,再 `python -m pipeline.cli --data data api --port 8000`,打开 `http://127.0.0.1:8000/`,
 顶部"Pipeline Agent"面板里选择/上传视频(`POST /api/media`,存到 `samples/`)、填写风格指令、选图像模型与预算后点"启动 Agent"(`POST /api/agent/runs` 另起子进程,日志在 `data/agent_logs/`)。
@@ -293,7 +299,7 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 
 > 所有数字来自本仓库的测试与脚本,可复现。**模型调用均为 Mock**;Mock 服务器的"计费账本"是恢复语义的判据。
 
-### 8.1 测试总览(129 个,全部通过,约 5 分钟,Windows)
+### 8.1 测试总览(135 个,全部通过,约 7 分钟,Windows)
 
 | 文件 | 个数 | 内容 |
 |---|---|---|
@@ -301,7 +307,7 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | `test_doubao_client.py` | 12 | `ArkDoubao` 对本地假服务器:请求形态、鉴权头、b64 解码、429/401/500/审核/未知 400 的映射、连接失败=未发出、缺密钥/缺模型 |
 | `test_api_style.py` | 2 | 提交校验、帧账本/图片/用量/报告接口、路径参数拒绝穿越 |
 | `test_engine.py` / `test_failures.py` / `test_chaos.py` / `test_smoke.py` | 11 / 14 / 1 / 1 | 引擎:见 8.3 |
-| `test_pipeline_agent.py` | 12 | Pipeline Agent:并行风格化、中断(KeyboardInterrupt 模拟)后 checkpoint 续跑不重复花钱、幂等阶段、跨线程缓存复用、失败重试/升级人工、手册拒绝、参数校验、`ArkChat`(MockTransport)、API |
+| `test_pipeline_agent.py` | 18 | Pipeline Agent:并行风格化、软中断后 checkpoint 续跑不重复花钱、**真实子进程中断(API 强杀进程树)后 CLI 续跑**、流程图状态、中断/继续接口的守卫、素材上传校验、幂等阶段、跨线程缓存复用、失败重试/升级人工、手册拒绝、参数校验、`ArkChat`(MockTransport)、API |
 | `test_agent_*` / `test_eval.py` / `test_api.py` | 9+19 / 2 / 3 | 旧 Agent 层与基础接口 |
 
 ### 8.2 逐帧流水线的恢复语义(Mock 服务器计费账本为判据)

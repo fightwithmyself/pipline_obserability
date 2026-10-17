@@ -201,8 +201,45 @@ def _print_agent_result(out: dict, ag, thread: str) -> int:
     return 0 if out["status"] == "SUCCEEDED" else 3
 
 
+def _pid_file(data: str, thread: str):
+    from pathlib import Path
+    d = Path(data) / "agent_logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{thread}.pid"
+
+
+def _drive_agent(a, thread: str, action) -> int:
+    """运行或继续一个 Agent 线程:写 pid 文件(看板据此判断"还在跑吗"、并能强制中断)、可选拉起 worker、
+    被中断(看板按钮/Ctrl+C)时留下 checkpoint 并提示如何继续。"""
+    from .agent.stages import RunInterrupted
+    from .proc import pid_alive
+    pf = _pid_file(a.data, thread)
+    if pf.exists():
+        try:
+            old = int(pf.read_text().strip())
+        except ValueError:
+            old = 0
+        if old and old != os.getpid() and pid_alive(old):
+            print(f"线程 {thread} 已有进程 {old} 在运行,拒绝重复运行", file=sys.stderr)
+            return 4
+    pf.write_text(str(os.getpid()))
+    ag = _make_agent(a)
+    ws = _Workers(a.data, a.workers) if a.workers else None
+    try:
+        return _print_agent_result(action(ag), ag, thread)
+    except (RunInterrupted, KeyboardInterrupt) as e:
+        print(f"\n已中断({e or 'Ctrl+C'})。checkpoint 已保存,继续执行: python -m pipeline.cli agent-resume {thread}",
+              file=sys.stderr)
+        return 130
+    finally:
+        if ws:
+            ws.stop()
+        ag.close()
+        pf.unlink(missing_ok=True)
+
+
 def cmd_agent_run(a) -> int:
-    """LangGraph Agent 驱动整条流水线。中断(Ctrl+C/进程被杀)后用 agent-resume 继续。"""
+    """LangGraph Agent 驱动整条流水线。中断后用 agent-resume 继续。"""
     cfg = {"source": a.source, "prompt": a.prompt, "provider": a.provider, "model": a.model, "reference": a.reference,
            "interp": a.interp, "target_height": a.height, "price_cny": a.price, "budget_cny": a.budget,
            "concurrency": a.concurrency, "on_reject": a.on_reject}
@@ -210,34 +247,12 @@ def cmd_agent_run(a) -> int:
     if a.provider == "mock":
         cfg.pop("model", None)
     thread = a.thread or f"run-{int(time.time())}"
-    ag = _make_agent(a)
-    ws = _Workers(a.data, a.workers) if a.workers else None
-    try:
-        out = ag.start(thread, cfg, a.request or f"请把视频 {os.path.basename(a.source)} 处理成风格化成品并发布。")
-        return _print_agent_result(out, ag, thread)
-    except KeyboardInterrupt:
-        print(f"\n已中断。继续执行: python -m pipeline.cli agent-resume {thread}", file=sys.stderr)
-        return 130
-    finally:
-        if ws:
-            ws.stop()
-        ag.close()
+    request = a.request or f"请把视频 {os.path.basename(a.source)} 处理成风格化成品并发布。"
+    return _drive_agent(a, thread, lambda ag: ag.start(thread, cfg, request))
 
 
 def cmd_agent_resume(a) -> int:
-    ag = _make_agent(a)
-    ws = _Workers(a.data, a.workers) if a.workers else None
-    try:
-        out = ag.resume(a.thread)
-        return _print_agent_result(out, ag, a.thread)
-    except KeyboardInterrupt:
-        print(f"\n已中断。继续执行: python -m pipeline.cli agent-resume {a.thread}", file=sys.stderr)
-        return 130
-    finally:
-        if ws:
-            ws.stop()
-        ag.close()
-
+    return _drive_agent(a, a.thread, lambda ag: ag.resume(a.thread))
 
 def cmd_agent_status(a) -> int:
     from .agent.orchestrator import run_report

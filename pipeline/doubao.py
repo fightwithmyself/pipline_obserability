@@ -221,7 +221,8 @@ class ArkDoubao:
     name = "ark"
 
     def __init__(self, model: str, *, size: str = "2K", watermark: bool = False, timeout_s: float = 180.0,
-                 base_url: str | None = None, api_key: str | None = None):
+                 base_url: str | None = None, api_key: str | None = None, api_prefix: str = "/api/v3"):
+        self.api_prefix = api_prefix
         if not model:
             raise FatalError("缺少模型 ID(方舟控制台里的 Seedream 型号或 Endpoint ID)", "bad_request")
         self.model = model
@@ -242,15 +243,15 @@ class ArkDoubao:
         if reference is not None:
             imgs.append(_data_uri(_to_jpeg_bytes(reference)))
         return {"model": self.model, "prompt": prompt, "image": imgs if len(imgs) > 1 else imgs[0],
-                "size": self.size, "response_format": "b64_json", "watermark": self.watermark,
-                "sequential_image_generation": "disabled"}
+                "size": self.size, "response_format": "b64_json", "watermark": self.watermark}
+        # 不传 sequential_image_generation:默认就是 disabled,而 5.0-flash 实测会因为带了这个参数返回 400
 
     def edit(self, *, image: bytes, prompt: str, reference: bytes | None, frame_key: str) -> EditResult:
         import httpx
         body = self.build_body(image, prompt, reference)
         headers = {"Authorization": f"Bearer {self._api_key()}", "Content-Type": "application/json"}
         try:
-            r = httpx.post(f"{self.base_url}/api/v3/images/generations", json=body, headers=headers,
+            r = httpx.post(f"{self.base_url}{self.api_prefix}/images/generations", json=body, headers=headers,
                            timeout=self.timeout_s)
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:       # 连接阶段失败 = 请求没有到达服务端
             raise Transient(f"connect error: {e}", request_maybe_sent=False)
@@ -289,4 +290,6 @@ def make_client(provider: str, *, model: str | None, data_dir: Path, chaos: dict
         return MockDoubao(data_dir, model or "mock-seedream", chaos, attempt, sleep)
     if provider == "ark":
         return ArkDoubao(model or "", size=size, watermark=watermark)
+    if provider == "ark_plan":      # Agent Plan:专属路径 /api/plan/v3 + 专属密钥(同样放在 ARK_API_KEY)
+        return ArkDoubao(model or "", size=size, watermark=watermark, api_prefix="/api/plan/v3")
     raise FatalError(f"未知 provider: {provider}", "bad_request")

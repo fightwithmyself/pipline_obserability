@@ -164,10 +164,10 @@ def frame_style_task(
         raise ValueError(f"素材格式需要是 {sorted(MEDIA_EXTS)} 之一")
     if not prompt or len(prompt) > 2000:
         raise ValueError("prompt 不能为空,且不超过 2000 字符")
-    if provider not in ("mock", "ark"):
-        raise ValueError("provider 只能是 mock 或 ark")
-    if provider == "ark" and not model:
-        raise ValueError("provider=ark 需要指定 model(方舟控制台里的模型 ID 或 Endpoint ID)")
+    if provider not in ("mock", "ark", "ark_plan"):
+        raise ValueError("provider 只能是 mock、ark 或 ark_plan")
+    if provider != "mock" and not model:
+        raise ValueError(f"provider={provider} 需要指定 model(方舟控制台里的模型 ID 或 Endpoint ID)")
     if not (1 <= chunks <= 32):
         raise ValueError("chunks 需要在 1..32")
     if stride < 1 or max_gap < stride:

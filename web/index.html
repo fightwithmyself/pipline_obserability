@@ -78,7 +78,8 @@
       <label>provider
         <select id="m_provider" onchange="$('m_model').disabled = this.value==='mock'">
           <option value="mock">mock(离线替身,不花钱)</option>
-          <option value="ark">ark(豆包,花钱;需要环境变量 ARK_API_KEY)</option>
+          <option value="ark">ark(豆包按量付费,花钱;需要环境变量 ARK_API_KEY)</option>
+          <option value="ark_plan">ark_plan(豆包 Agent Plan,专属路径;ARK_API_KEY 放专属密钥)</option>
         </select></label>
       <label>模型 ID(provider=ark 时必填)<input type="text" id="m_model" disabled placeholder="方舟控制台里的模型 ID"></label>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px">

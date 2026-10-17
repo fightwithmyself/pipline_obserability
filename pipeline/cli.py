@@ -66,7 +66,7 @@ def cmd_submit_style(a) -> int:
     chaos = json.loads(a.chaos) if a.chaos else None
     if a.inject:
         chaos = {**(chaos or {}), **frame_style_inject_presets(a.chunks)[a.inject]}
-    if a.provider == "ark" and not os.environ.get("ARK_API_KEY"):
+    if a.provider != "mock" and not os.environ.get("ARK_API_KEY"):
         print("提示:还没有设置环境变量 ARK_API_KEY,worker 运行时会在工序 3 立即失败(不会产生费用)", file=sys.stderr)
     try:
         spec = frame_style_task(
@@ -173,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     sv.add_argument("--source", required=True, help="本地视频文件")
     sv.add_argument("--prompt", required=True, help="风格/替换指令,如:日系动漫风格,保持人物与动作不变")
     sv.add_argument("--name", default="anime-style")
-    sv.add_argument("--provider", choices=["mock", "ark"], default="mock", help="mock=离线替身(不花钱);ark=豆包(花钱)")
+    sv.add_argument("--provider", choices=["mock", "ark", "ark_plan"], default="mock",
+                    help="mock=离线替身(不花钱);ark=豆包按量付费;ark_plan=豆包 Agent Plan(专属路径与专属密钥,扣套餐额度)")
     sv.add_argument("--model", help="provider=ark 时必填:方舟控制台里的模型 ID 或 Endpoint ID")
     sv.add_argument("--reference", help="锚点/人物参考图(可选)")
     sv.add_argument("--chunks", type=int, default=4)

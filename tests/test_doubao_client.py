@@ -82,6 +82,13 @@ def test_request_shape_and_success(fake):
     assert r.usage["output_tokens"] == 77 and r.request_id == "rid-1"
 
 
+def test_agent_plan_uses_plan_path(fake):
+    fake.reply = (200, ok_payload(png()), {})
+    ArkDoubao("m", base_url=fake.url, api_key="k", timeout_s=5, api_prefix="/api/plan/v3").edit(
+        image=png(), prompt="p", reference=None, frame_key="f")
+    assert fake.seen[0]["path"] == "/api/plan/v3/images/generations"
+
+
 def test_reference_sends_two_images(fake):
     fake.reply = (200, ok_payload(png()), {})
     client(fake).edit(image=png(), prompt="p", reference=png((1, 2, 3)), frame_key="f0")

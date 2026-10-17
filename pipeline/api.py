@@ -46,7 +46,7 @@ class StyleTaskRequest(BaseModel):
     name: str = "anime-style"
     source: str                                   # 素材目录下的文件名,不接受路径
     prompt: str = Field(min_length=1, max_length=2000)
-    provider: Literal["mock", "ark"] = "mock"
+    provider: Literal["mock", "ark", "ark_plan"] = "mock"
     model: str | None = None
     reference: str | None = None                  # 素材目录下的参考图文件名(可选)
     chunks: int = Field(4, ge=1, le=16)

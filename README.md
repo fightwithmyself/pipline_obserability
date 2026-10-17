@@ -221,7 +221,7 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 | 素材 | 6.47 s、194 帧、带音轨;手机竖拍,显示尺寸 320×568(旋转 270°) |
 | 关键帧 | 155 帧(24fps 标准化后)中选出 **27 张**(17%) |
 | 模型调用 | 27 次 / 27 张成功 / 0 次重试 / 0 降级 / 0 可能多付 |
-| **token(接口返回的 `usage`)** | **423,846 output_tokens**,每张约 15.7k(总 token = output_tokens);单帧冒烟那次为 17,052 |
+| **token(接口返回的 `usage`)** | **423,846 output_tokens**,每张约 15.7k(总 token = output_tokens);单帧冒烟那次为 17,052。**只记在首次真实调用的任务 `t_26d45b574b90` 上**;之后重跑的任务因命中缓存,"本任务 output_tokens"为 0,当初的消耗另记在"复用的原 tokens"里(见下) |
 | 单次延迟 | 单帧冒烟 16.0 s;整任务 3 个并发 |
 | 整任务耗时 | **约 108 s**(含 ffmpeg 与全部步骤) |
 | 返回图片 | `b64_json` 可正常解码;`size=2K` 对 9:16 的图返回 1568×2784,与源比例一致;`watermark=false` 被接受,成片目测无水印 |
@@ -231,6 +231,19 @@ ingest ─► keyframes ─► [reference] ─► stylize_0..N-1 (gpu 车道) �
 成品 `samples/_out/cba_anime_REAL.mp4`;源帧/结果帧对比 `cba_anime_REAL_compare.png`。**画面确实是日式动漫风**(线稿、赛璐璐上色、人物与动作保留),
 但有两个**肉眼可见的问题**,QC 没有发现(见 9.2):① 关键帧之间的补帧是线性混合,**运动的人物出现重影**(`cba_anime_REAL_ghosting_frames60-63.png`);
 ② 每张关键帧是模型独立生成的,观众席、人物脸部等细节在相邻关键帧间不一致,混合时更明显。
+
+**哪些步骤会调用豆包**:只有 `stylize_0..N`(工序 3,每块一个步骤,逐关键帧一次请求)。其余 13 个步骤(ingest、keyframes、poststats、post_*、qc、mux、package、publish)都是本地 ffmpeg/numpy,不调模型。
+所以 token 只会出现在 `stylize_*` 的用量里;看板"用量与费用"面板、`GET /api/tasks/<id>/usage` 都按它汇总。
+
+**为什么后来的任务里 token 是 0(我之前没说清,也有记账缺陷)**:27 张图在第一次真实运行(`t_26d45b574b90`)里就生成并写入帧缓存了。
+之后为了调补帧重跑,`stylize_*` 命中缓存,接口 0 次调用,本任务确实没花钱,"本任务 output_tokens"就是 0——这是对的。
+但旧代码只记 0,当初的消耗在这些任务里看不到;同时 QC 报告/`metadata.json` 读的是步骤缓存里**旧的** `usage.json`,又显示 423,846 / 27 次调用,
+两处互相矛盾,而且后者会让人误以为这个任务又花了一遍。现已修正:
+- 命中帧缓存时,把缓存里记着的原消耗另记为 `reused_tokens / reused_images`(不计入本任务花费);
+- 看板面板分开显示"本任务 output_tokens"与"复用的原 tokens";`/usage` 同样;
+- QC 与 `metadata.json` 的 usage 带 `scope` 说明(产物血缘累计,不等于本任务新增花费),并带 `reused_output_tokens`。
+验证:新任务 `t_97c8e14b7eea`:调用 0、本任务 tokens 0、复用 423,846 tokens / 27 张(截图 `samples/_out/dashboard_usage.png`),测试里也加了断言。
+遗留:旧任务(修复前跑的)里整块命中步骤缓存的块,复用量是从缓存的 `usage.json` 读的,不是逐帧精确值;"真实消耗"的权威数字仍然只有首次运行那条记录和平台账单。
 
 **减轻重影(第二版,不额外调用接口,0 元)**:`interp=mc`。27 张风格化关键帧直接复用(帧缓存/步骤缓存),只重算后处理。
 结果 `samples/_out/cba_anime_REAL_mc.mp4`(对比图 `_mc_compare.png`,重影对照 `ghosting_old_vs_new_frames60-63.png`)。同时给 QC 加了**结构保真度**指标

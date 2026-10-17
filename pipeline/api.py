@@ -263,11 +263,22 @@ def create_app(data_dir: str | Path, llm_factory: Callable[[], Any] | None = Non
             d["frames"] += 1
             for k in ("calls", "billed", "maybe_billed", "output_tokens"):
                 d[k] += int(it.get(k) or 0)
+            d["reused_tokens"] = d.get("reused_tokens", 0) + int(it.get("reused_tokens") or 0)
+            d["reused_images"] = d.get("reused_images", 0) + int(it.get("reused_images") or 0)
             d["cost_cny_est"] = round(d["cost_cny_est"] + float(it.get("cost_cny_est") or 0), 4)
             d["cost_maybe_extra_cny_est"] = round(d["cost_maybe_extra_cny_est"] + float(it.get("cost_maybe_extra_cny_est") or 0), 4)
             d["cached"] += 1 if it.get("cached") else 0
             d["degraded"] += 1 if it.get("degraded") else 0
             d["failed"] += 1 if it["status"] == "FAILED" else 0
+        # 整块命中步骤缓存的块没有逐帧记录;它的 usage.json 是当初生成时的用量,算作"复用"
+        for key in {it["step_key"] for it in _frame_items(eng, task_id) if it.get("step_cached")}:
+            r = eng.conn.execute("SELECT outputs FROM steps WHERE task_id=? AND key=?", (task_id, key)).fetchone()
+            outs = json.loads(r["outputs"] or "{}") if r else {}
+            if "usage.json" in outs:
+                u = json.loads(eng.store.path(outs["usage.json"]["sha256"]).read_text(encoding="utf-8"))
+                d = per[key]
+                d["reused_tokens"] = int(u.get("output_tokens", 0)) + int(u.get("reused_output_tokens", 0))
+                d["reused_images"] = int(u.get("billed", 0)) + int(u.get("reused_images", 0))
         tot: dict[str, Any] = {}
         for d in per.values():
             for k, v in d.items():

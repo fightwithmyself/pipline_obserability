@@ -413,6 +413,10 @@ class RateLimiter:
             self._pause_until = max(self._pause_until, time.monotonic() + seconds * self.scale)
 
 
+USAGE_SCOPE = ("产物血缘累计用量:含命中步骤缓存的块当初生成时的消耗,不等于本任务新增花费;"
+               "本任务新增花费以 GET /api/tasks/{id}/usage 为准。reused_output_tokens=命中帧缓存的图当初的 token")
+
+
 def _led_view(led: dict, price: float) -> dict:
     """账本 → 观测字段(经 item 消息写入 items 表)。"""
     billed = int(led.get("billed", 0))
@@ -420,6 +424,7 @@ def _led_view(led: dict, price: float) -> dict:
     return {
         "calls": int(led.get("calls", 0)), "billed": billed, "maybe_billed": maybe,
         "output_tokens": int(led.get("output_tokens", 0)),
+        "reused_tokens": int(led.get("reused_tokens", 0)), "reused_images": int(led.get("reused_images", 0)),
         "cost_cny_est": round(billed * price, 4), "cost_maybe_extra_cny_est": round(maybe * price, 4),
         "cached": bool(led.get("cached")), "resumed": bool(led.get("resumed")),
         "degraded": led.get("state") == "DEGRADED", "maybe_duplicated": bool(led.get("maybe_duplicated")),
@@ -517,9 +522,14 @@ def an_stylize(ctx: StepContext) -> None:
         # 2) 跨任务帧缓存
         hit = cache.get(fkey)
         if hit is not None:
-            data, _ = hit
+            data, meta = hit
             _atomic_write(out_path, data)
-            led.update(state="DONE", out_sha=_sha_bytes(data), cached=True, error=None)
+            # 命中缓存本任务不花钱(calls/billed/output_tokens 不增加);把"当初生成这张图花了多少"另记,
+            # 否则看板和报告上这张图的 token 会凭空消失
+            ou = (meta or {}).get("usage") or {}
+            led.update(state="DONE", out_sha=_sha_bytes(data), cached=True, error=None,
+                       reused_tokens=int(ou.get("output_tokens", 0)), reused_images=int(ou.get("generated_images", 1)),
+                       reused_model=(meta or {}).get("model"))
             write_led(idx, led)
             emit(idx, led)
             return led
@@ -629,11 +639,15 @@ def an_stylize(ctx: StepContext) -> None:
     summary = {"total": total, "done": 0, "cached": 0, "resumed": 0, "degraded": [], "failed": [],
                "skipped": [], "maybe_duplicated": []}
     tot = {"calls": 0, "billed": 0, "maybe_billed": 0, "output_tokens": 0}
+    reused = {"reused_output_tokens": 0, "reused_images": 0}
     for idx in idxs:
         led = results.get(idx) or leds.get(idx) or {}
         st = led.get("state")
         for k in tot:
             tot[k] += int(led.get(k, 0))
+        if led.get("cached"):
+            reused["reused_output_tokens"] += int(led.get("reused_tokens", 0))
+            reused["reused_images"] += int(led.get("reused_images", 0))
         if led.get("maybe_duplicated"):
             summary["maybe_duplicated"].append(idx)
         if st == "DONE":
@@ -646,7 +660,7 @@ def an_stylize(ctx: StepContext) -> None:
             summary["failed"].append({"idx": idx, "kind": led.get("error_kind"), "error": (led.get("error") or "")[:160]})
         else:
             summary["skipped"].append(idx)
-    usage = {**tot, "price_cny": price, "cost_cny_est": round(tot["billed"] * price, 4),
+    usage = {**tot, **reused, "price_cny": price, "cost_cny_est": round(tot["billed"] * price, 4),
              "cost_maybe_extra_cny_est": round(tot["maybe_billed"] * price, 4),
              "cost_note": "按标价估算;被审核拒绝的图不计费(以账单为准)。maybe_billed 是'响应丢失/进程中途死亡'导致的可能多付",
              "provider": provider, "model": model_name, "chunk": ci, "frames": summary}
@@ -944,6 +958,7 @@ def an_qc(ctx: StepContext) -> None:
                                 "(阈值为经验值)")
     # 降级与可能多付(来自工序 3 的用量记录)
     degraded, maybe_dup, billed, cost, maybe_extra, tokens, calls = 0, 0, 0, 0.0, 0.0, 0, 0
+    reused_tokens = 0
     for i in range(N):
         u = _load_json(ctx.input_path(f"stylize_{i}", "usage.json"))
         degraded += len(u["frames"]["degraded"])
@@ -951,6 +966,7 @@ def an_qc(ctx: StepContext) -> None:
         billed += u["billed"]
         calls += u["calls"]
         tokens += u["output_tokens"]
+        reused_tokens += u.get("reused_output_tokens", 0)
         cost += u["cost_cny_est"]
         maybe_extra += u["cost_maybe_extra_cny_est"]
     if degraded:
@@ -986,7 +1002,8 @@ def an_qc(ctx: StepContext) -> None:
               "structure": struct,
               "black_frame_ratio": {"out": round(black, 4), "src": round(black_src, 4)},
               "degraded_keyframes": degraded, "maybe_duplicated_frames": maybe_dup,
-              "usage": {"calls": calls, "billed_images": billed, "output_tokens": tokens,
+              "usage": {"scope": USAGE_SCOPE, "calls": calls, "billed_images": billed, "output_tokens": tokens,
+                        "reused_output_tokens": reused_tokens,
                         "cost_cny_est": round(cost, 4), "cost_maybe_extra_cny_est": round(maybe_extra, 4)}}
     ctx.note("qc", report)
     ctx.output("qc.json", canonical_json(report).encode())
@@ -1073,13 +1090,14 @@ def an_package(ctx: StepContext) -> None:
                     "-vf", "scale=320:-2", "-q:v", "3", str(ctx.output_path("thumbnail.jpg"))])
     except MediaError as e:
         raise StepError(ErrorKind.TRANSIENT, str(e))
-    usage = {"calls": 0, "billed_images": 0, "output_tokens": 0, "cost_cny_est": 0.0, "cost_maybe_extra_cny_est": 0.0,
+    usage = {"scope": USAGE_SCOPE, "calls": 0, "billed_images": 0, "output_tokens": 0, "reused_output_tokens": 0, "cost_cny_est": 0.0, "cost_maybe_extra_cny_est": 0.0,
              "cached_frames": 0, "resumed_frames": 0, "degraded_frames": [], "maybe_duplicated_frames": []}
     for i in range(N):
         u = _load_json(ctx.input_path(f"stylize_{i}", "usage.json"))
         usage["calls"] += u["calls"]
         usage["billed_images"] += u["billed"]
         usage["output_tokens"] += u["output_tokens"]
+        usage["reused_output_tokens"] += u.get("reused_output_tokens", 0)
         usage["cost_cny_est"] = round(usage["cost_cny_est"] + u["cost_cny_est"], 4)
         usage["cost_maybe_extra_cny_est"] = round(usage["cost_maybe_extra_cny_est"] + u["cost_maybe_extra_cny_est"], 4)
         usage["cached_frames"] += u["frames"]["cached"]

@@ -194,7 +194,7 @@ def frame_style_task(
         ref_info = {"path": str(rp), "sha256": _sha_file(rp)}
 
     # 步骤逻辑版本:改了某类步骤的算法就把它加一,否则相同参数会命中旧产物(这次补帧改动就踩到了)
-    versions = {"an_post": "3", "an_qc": "2"}
+    versions = {"an_post": "3", "an_qc": "3", "an_stylize": "2", "an_package": "2"}
 
     def mk(key: str, type_: str, deps: list[str], params: dict, *, cacheable: bool = True, resource: str = "cpu",
            timeout_s: float = 1800.0, stall: float | None = None) -> StepSpec:

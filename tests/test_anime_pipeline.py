@@ -134,6 +134,10 @@ def test_same_source_again_costs_nothing(engine, data_dir, clip):
     assert meta["stylize"]["billed_images"] == 0
     assert meta["stylize"]["cached_frames"] == meta["keyframes"]["count"]
     assert meta["stylize"]["cost_cny_est"] == 0
+    # 命中缓存的图当初的 token 不能凭空消失:本任务新增为 0,复用量单独记录
+    assert meta["stylize"]["output_tokens"] == 0
+    first = out_json(engine, t1["id"], "package", "metadata.json")
+    assert meta["stylize"]["reused_output_tokens"] == first["stylize"]["output_tokens"] > 0
 
 
 def test_prompt_change_invalidates_frame_cache(engine, data_dir, clip):

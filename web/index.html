@@ -222,14 +222,15 @@ async function renderFrames(t) {
   $('usage').innerHTML = us.total && Object.keys(u).length ? `
     <div>${esc(us.provider || '')} ${esc(us.model || '')} · 单价 ${esc(us.price_cny)} 元/张</div>
     <table style="width:auto;margin:4px 0"><tr><td class="muted">帧数</td><td>${u.frames}</td><td class="muted">接口调用</td><td>${u.calls}</td></tr>
-      <tr><td class="muted">计费张数</td><td>${u.billed}</td><td class="muted">output_tokens</td><td>${u.output_tokens}</td></tr>
+      <tr><td class="muted">计费张数</td><td>${u.billed}</td><td class="muted">本任务 output_tokens</td><td>${u.output_tokens}</td></tr>
+      <tr><td class="muted">复用缓存的图</td><td>${u.reused_images || 0}</td><td class="muted" title="命中缓存的图当初生成时的消耗,本任务没有重复计费">复用的原 tokens</td><td>${u.reused_tokens || 0}</td></tr>
       <tr><td class="muted">帧缓存命中</td><td>${u.cached}</td><td class="muted">降级 / 失败</td><td>${u.degraded} / ${u.failed}</td></tr></table>
     <div>费用估算 <b>${(u.cost_cny_est || 0).toFixed(2)} 元</b>${bud ? ` / 预算 ${bud} 元` : ''}
       ${u.maybe_billed ? `<span class="err"> · 可能多付 ${u.maybe_billed} 张 ≈ ${(u.cost_maybe_extra_cny_est || 0).toFixed(2)} 元</span>` : ''}</div>
     <div class="bar ${pct > 90 ? 'bad' : ''}"><i style="width:${pct}%"></i></div>
     <div class="muted" style="margin-top:4px">${esc(us.note)}</div>
-    <details style="margin-top:4px"><summary>按块</summary><table><tr><th>块</th><th>帧</th><th>调用</th><th>计费</th><th>tokens</th><th>费用</th></tr>
-      ${Object.entries(us.per_step).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.frames}</td><td>${v.calls}</td><td>${v.billed}</td><td>${v.output_tokens}</td><td>${v.cost_cny_est}</td></tr>`).join('')}</table></details>`
+    <details style="margin-top:4px"><summary>按块</summary><table><tr><th>块</th><th>帧</th><th>调用</th><th>计费</th><th>tokens</th><th>复用 tokens</th><th>费用</th></tr>
+      ${Object.entries(us.per_step).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.frames}</td><td>${v.calls}</td><td>${v.billed}</td><td>${v.output_tokens}</td><td>${v.reused_tokens || 0}</td><td>${v.cost_cny_est}</td></tr>`).join('')}</table></details>`
     : '<span class="muted">还没有用量记录</span>';
 }
 async function pickFrame(step, item) { selFrame = {step, item}; _gridSig = ''; _viewSig = ''; if (curTask) await renderFrames(curTask); renderFrameView(); }
@@ -246,7 +247,7 @@ async function renderFrameView() {
     <div style="display:flex;gap:8px;margin:4px 0"><div><div class="muted">源帧</div><img src="${base}?kind=src&w=360" style="max-width:100%;border:1px solid var(--line)"></div>
       <div><div class="muted">结果</div><img src="${base}?kind=out&w=360" style="max-width:100%;border:1px solid var(--line)" onerror="this.alt='还没有结果'"></div></div>
     <table style="width:auto"><tr><td class="muted">调用次数</td><td>${f.calls}</td><td class="muted">计费</td><td>${f.billed}</td><td class="muted">可能多付</td><td>${f.maybe_billed}</td></tr>
-      <tr><td class="muted">tokens</td><td>${f.output_tokens}</td><td class="muted">缓存/复用</td><td>${f.cached ? '帧缓存' : f.resumed ? '续跑复用' : '-'}</td><td class="muted">耗时</td><td>${f.latency_s ?? '-'}s</td></tr></table>
+      <tr><td class="muted">tokens</td><td>${f.output_tokens}${f.reused_tokens ? ` <span class="muted">(复用原 ${f.reused_tokens})</span>` : ''}</td><td class="muted">缓存/复用</td><td>${f.cached ? '帧缓存' : f.resumed ? '续跑复用' : '-'}</td><td class="muted">耗时</td><td>${f.latency_s ?? '-'}s</td></tr></table>
     ${f.error ? `<div class="err">${esc(f.error_kind || '')}: ${esc(f.error)}</div>` : ''}
     ${f.size_adjusted ? `<div class="muted">返回尺寸 ${f.size_adjusted.join('x')},已规整到标准尺寸</div>` : ''}`;
 }
